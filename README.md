@@ -74,4 +74,7 @@ and price feeds used in the setup scripts are mocks, for testnets only.
 
 ## License
 
-MIT (see the SPDX headers on each source file).
+Business Source License 1.1 (BUSL-1.1) — see [LICENSE](./LICENSE). Non-commercial use is permitted;
+commercial use requires a separate license from the Licensor. The license converts to **MIT** on the
+Change Date (2032-07-04). Third-party code under `contracts/lib/`
+(OpenZeppelin, forge-std) remains under its own MIT license.
