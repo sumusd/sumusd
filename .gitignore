@@ -1,0 +1,9 @@
+# contracts (Foundry)
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/.env
+
+# misc
+.DS_Store
+*.log
