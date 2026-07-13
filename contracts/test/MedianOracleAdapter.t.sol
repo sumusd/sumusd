@@ -113,6 +113,33 @@ contract MedianOracleAdapterTest is Test {
         median.setSources(token, oracles, 1, 0);
     }
 
+    function test_MaxSourcesAllowedAtRail() public {
+        // Exactly MAX_SOURCES (7) is accepted.
+        IPriceOracle[] memory seven = new IPriceOracle[](7);
+        for (uint256 i; i < 7; ++i) {
+            MockOracle m = new MockOracle();
+            m.setPrice(token, 1e18);
+            seven[i] = m;
+        }
+        vm.prank(owner);
+        median.setSources(token, seven, 1, 0);
+        (IPriceOracle[] memory got, uint32 mf,) = median.sourcesOf(token);
+        assertEq(got.length, 7, "7 sources configured");
+        assertEq(mf, 1);
+        assertEq(median.getPriceWad(token), 1e18, "median of 7 identical sources");
+    }
+
+    function test_Revert_TooManySources() public {
+        // 8 sources exceeds the MAX_SOURCES (7) rail.
+        IPriceOracle[] memory tooMany = new IPriceOracle[](8);
+        for (uint256 i; i < 8; ++i) {
+            tooMany[i] = new MockOracle();
+        }
+        vm.prank(owner);
+        vm.expectPartialRevert(MedianOracleAdapter.TooManySources.selector);
+        median.setSources(token, tooMany, 1, 0);
+    }
+
     function test_Revert_SetSources_NotOwner() public {
         IPriceOracle[] memory oracles = new IPriceOracle[](1);
         oracles[0] = s0;

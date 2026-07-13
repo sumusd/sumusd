@@ -20,6 +20,11 @@ import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
 ///      than bubbling up. Holds no funds; pure read-only pricing with owner-gated configuration.
 contract MedianOracleAdapter is IPriceOracle, Ownable2Step {
     uint256 internal constant BPS = 10_000;
+    /// @notice Immutable cap on the number of component sources per token. Bounds the O(n) read loop
+    ///         and O(n^2) sort in {getPriceWad} — which runs inside the engine's basket-wide loops on
+    ///         every deposit/redeem — so governance can never configure a source array large enough to
+    ///         make pricing prohibitively expensive. Mirrors the engine's `MAX_COLLATERALS` rail.
+    uint256 internal constant MAX_SOURCES = 7;
 
     /// @notice Per-collateral aggregation configuration.
     struct Sources {
@@ -35,6 +40,7 @@ contract MedianOracleAdapter is IPriceOracle, Ownable2Step {
 
     error NoSources(address token);
     error InvalidQuorum(uint32 minFresh, uint256 count);
+    error TooManySources(uint256 count, uint256 max);
     error ZeroSource();
     error InsufficientFreshSources(address token, uint256 fresh, uint32 required);
     error SpreadTooWide(address token, uint256 spreadBps, uint32 maxSpreadBps);
@@ -51,11 +57,13 @@ contract MedianOracleAdapter is IPriceOracle, Ownable2Step {
     /// @param minFresh     Minimum number that must answer for a valid median. Must be in [1, oracles.length].
     /// @param maxSpreadBps If > 0, reject when the fresh sources' (max - min) exceeds this fraction of the
     ///                     median (a disagreement circuit breaker). 0 disables the check (median only).
+    /// @dev The source count is bounded to [1, {MAX_SOURCES}].
     function setSources(address token, IPriceOracle[] calldata oracles, uint32 minFresh, uint32 maxSpreadBps)
         external
         onlyOwner
     {
         uint256 count = oracles.length;
+        if (count > MAX_SOURCES) revert TooManySources(count, MAX_SOURCES);
         if (minFresh == 0 || minFresh > count) revert InvalidQuorum(minFresh, count);
         for (uint256 i; i < count; ++i) {
             if (address(oracles[i]) == address(0)) revert ZeroSource();
