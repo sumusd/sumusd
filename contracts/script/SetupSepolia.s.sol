@@ -5,23 +5,28 @@ import {Script, console2} from "forge-std/Script.sol";
 import {SumUSD} from "../src/SumUSD.sol";
 import {SumUSDEngine} from "../src/SumUSDEngine.sol";
 import {ChainlinkOracleAdapter} from "../src/oracles/ChainlinkOracleAdapter.sol";
+import {MedianOracleAdapter} from "../src/oracles/MedianOracleAdapter.sol";
+import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {MockERC20} from "../test/mocks/MockERC20.sol";
 import {MockAggregatorV3} from "../test/mocks/MockAggregatorV3.sol";
 
-/// @notice End-to-end testnet bringup: deploys the protocol plus mock collateral and the production
-///         {ChainlinkOracleAdapter} fed by settable Chainlink-shaped mock aggregators, lists every
-///         flavor, and faucets some collateral to the deployer so the dapp is immediately usable on
-///         Sepolia.
+/// @notice End-to-end testnet bringup: deploys the protocol plus mock collateral and a
+///         {MedianOracleAdapter} that prices each flavor over TWO independent {ChainlinkOracleAdapter}
+///         providers (each wrapping its own settable Chainlink-shaped mock aggregator), lists every
+///         flavor against the median, and faucets some collateral to the deployer so the dapp is
+///         immediately usable on Sepolia.
 ///
 /// @dev Intended for testnets ONLY — the collateral and price feeds here are unaudited mocks anyone
-///      can mint/reprice. It wires the *real* {ChainlinkOracleAdapter} (not a bare settable oracle) so
-///      the production oracle path — decimal scaling, staleness, and the sane-price band — is exercised
-///      end to end. Because nothing pushes fresh rounds to the mock aggregators on a testnet, the
-///      staleness bound here is set deliberately long (see {FEED_STALENESS}) so the dapp keeps working
-///      without a keeper; a real deployment points {ChainlinkOracleAdapter.setFeed} at genuine Chainlink
-///      aggregators with a heartbeat-based staleness (e.g. ~1h) and may layer a {MedianOracleAdapter}
-///      over several providers. The aggregator addresses are logged so a tester can age/reprice a feed
-///      (e.g. `agg.setUpdatedAt(...)` / `agg.setAnswer(...)`) to exercise the fail-closed behavior.
+///      can mint/reprice. It wires the *real* production oracle stack (two `ChainlinkOracleAdapter`s
+///      under a `MedianOracleAdapter`) so the full path — per-provider decimal scaling / staleness /
+///      sane-band, then median + quorum + spread breaker — is exercised end to end. Because nothing
+///      pushes fresh rounds to the mock aggregators on a testnet, the staleness bound here is set
+///      deliberately long (see {FEED_STALENESS}) so the dapp keeps working without a keeper; a real
+///      deployment points each provider's `setFeed` at genuine Chainlink aggregators with a
+///      heartbeat-based staleness (e.g. ~1h). The aggregator addresses are logged so a tester can
+///      age/reprice one feed (`agg.setUpdatedAt(...)` / `agg.setAnswer(...)`) to exercise the
+///      median's outage tolerance (`MIN_FRESH = 1`, so the surviving feed still prices) and the
+///      disagreement breaker (`MAX_SPREAD_BPS`).
 ///
 /// Usage:
 ///   forge script script/SetupSepolia.s.sol:SetupSepolia \
@@ -44,6 +49,12 @@ contract SetupSepolia is Script {
     uint128 internal constant SANE_MIN = 0.9e18;
     uint128 internal constant SANE_MAX = 1.1e18;
 
+    // Median config: require at least 1 fresh provider (tolerate one feed outage; the survivor still
+    // prices), and reject when the two fresh providers disagree by more than 1% (a manipulation / bad-
+    // feed circuit breaker; median-of-2 is their average). A stricter setup could require both fresh.
+    uint32 internal constant MIN_FRESH = 1;
+    uint32 internal constant MAX_SPREAD_BPS = 100; // 1%
+
     function run() external {
         vm.startBroadcast();
         address admin = msg.sender;
@@ -59,22 +70,23 @@ contract SetupSepolia is Script {
         MockERC20 flavorB = new MockERC20("Flavor B", "FLAV-B", 6);
         MockERC20 flavorC = new MockERC20("Flavor C", "FLAV-C", 18);
 
-        // Production oracle adapter, fed by settable Chainlink-shaped mock aggregators (all at $1.00,
-        // fresh as of deployment). On mainnet these aggregators are the real Chainlink feeds.
-        ChainlinkOracleAdapter oracle = new ChainlinkOracleAdapter(admin);
-        MockAggregatorV3 aggA = new MockAggregatorV3(FEED_DECIMALS, FEED_ONE, block.timestamp);
-        MockAggregatorV3 aggB = new MockAggregatorV3(FEED_DECIMALS, FEED_ONE, block.timestamp);
-        MockAggregatorV3 aggC = new MockAggregatorV3(FEED_DECIMALS, FEED_ONE, block.timestamp);
-        oracle.setFeed(address(flavorA), address(aggA), FEED_STALENESS, SANE_MIN, SANE_MAX);
-        oracle.setFeed(address(flavorB), address(aggB), FEED_STALENESS, SANE_MIN, SANE_MAX);
-        oracle.setFeed(address(flavorC), address(aggC), FEED_STALENESS, SANE_MIN, SANE_MAX);
+        // Two independent Chainlink-shaped oracle providers, plus a median over them. On mainnet the
+        // aggregators wired below are the real Chainlink (and a second provider's) feeds.
+        ChainlinkOracleAdapter oracle1 = new ChainlinkOracleAdapter(admin);
+        ChainlinkOracleAdapter oracle2 = new ChainlinkOracleAdapter(admin);
+        MedianOracleAdapter median = new MedianOracleAdapter(admin);
 
-        // List flavors: 99% base redeem rate for the most liquid two, 97% for a conservatively-rated one
-        // (the base haircut plus the tilt below leaves headroom to reward over-represented
-        // redemptions). Balance is maintained by the convex tilt.
-        engine.setCollateral(address(flavorA), true, BASE_STABLE, oracle);
-        engine.setCollateral(address(flavorB), true, BASE_STABLE, oracle);
-        engine.setCollateral(address(flavorC), true, BASE_C, oracle);
+        // Per flavor: two mock aggregators (one per provider) at $1.00, wired into each provider adapter
+        // and medianized. Logs the aggregator pair for each flavor.
+        _wireMedianFeeds(oracle1, oracle2, median, address(flavorA));
+        _wireMedianFeeds(oracle1, oracle2, median, address(flavorB));
+        _wireMedianFeeds(oracle1, oracle2, median, address(flavorC));
+
+        // List flavors against the MEDIAN oracle: 99% base redeem rate for the most liquid two, 97% for
+        // a conservatively-rated one. Balance is maintained by the convex tilt.
+        engine.setCollateral(address(flavorA), true, BASE_STABLE, median);
+        engine.setCollateral(address(flavorB), true, BASE_STABLE, median);
+        engine.setCollateral(address(flavorC), true, BASE_C, median);
 
         // Convex weight-tilted haircut: redeeming an over-represented flavor is cheaper, and an
         // under-represented one gets steeply more expensive as it depletes — nudging rebalancing.
@@ -102,10 +114,34 @@ contract SetupSepolia is Script {
         console2.log("NEXT_PUBLIC_FLAVOR_B=%s", address(flavorB));
         console2.log("NEXT_PUBLIC_FLAVOR_C=%s", address(flavorC));
         console2.log("");
-        console2.log("Oracle adapter:  %s", address(oracle));
-        console2.log("Aggregator A:    %s", address(aggA));
-        console2.log("Aggregator B:    %s", address(aggB));
-        console2.log("Aggregator C:    %s", address(aggC));
-        console2.log("(reprice/age an aggregator to exercise the adapter's fail-closed path)");
+        console2.log("Median oracle (engine reads this): %s", address(median));
+        console2.log("Provider 1 (ChainlinkOracleAdapter): %s", address(oracle1));
+        console2.log("Provider 2 (ChainlinkOracleAdapter): %s", address(oracle2));
+        console2.log("(reprice/age one provider's aggregator to exercise the median's outage tolerance");
+        console2.log(" and disagreement breaker; per-flavor aggregator pairs are logged above)");
+    }
+
+    /// @dev Deploy two mock aggregators for `token` (one per provider), wire each into its provider
+    ///      adapter, and configure the median over both providers. Kept as a helper so {run} stays
+    ///      under the stack-depth limit.
+    function _wireMedianFeeds(
+        ChainlinkOracleAdapter oracle1,
+        ChainlinkOracleAdapter oracle2,
+        MedianOracleAdapter median,
+        address token
+    ) internal {
+        MockAggregatorV3 agg1 = new MockAggregatorV3(FEED_DECIMALS, FEED_ONE, block.timestamp);
+        MockAggregatorV3 agg2 = new MockAggregatorV3(FEED_DECIMALS, FEED_ONE, block.timestamp);
+        oracle1.setFeed(token, address(agg1), FEED_STALENESS, SANE_MIN, SANE_MAX);
+        oracle2.setFeed(token, address(agg2), FEED_STALENESS, SANE_MIN, SANE_MAX);
+
+        IPriceOracle[] memory sources = new IPriceOracle[](2);
+        sources[0] = oracle1;
+        sources[1] = oracle2;
+        median.setSources(token, sources, MIN_FRESH, MAX_SPREAD_BPS);
+
+        console2.log("Flavor feeds  token:", token);
+        console2.log("  provider 1 aggregator:", address(agg1));
+        console2.log("  provider 2 aggregator:", address(agg2));
     }
 }
