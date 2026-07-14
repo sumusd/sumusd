@@ -397,6 +397,33 @@ Three properties keep it safe:
   redemption into redeemer / recipient / retained, so quotes never diverge from what `redeem` pays.
   (`currentRedeemRateBps` still reports the tilt rate only — the fee is a separate flat bps.)
 
+### 5.6 Batch redemption (`redeemBatch`)
+
+A holder can redeem several flavors in one transaction with
+`redeemBatch(collaterals[], sumUsdAmounts[], minOuts[])`, which returns the collateral received per
+leg. This is a convenience over calling `redeem` N times — most useful for spreading a large exit
+across flavors rather than concentrating it on one and paying its convex scarcity premium (§5.2), and
+for cutting N approvals/transactions to one. It changes no economics:
+
+- **Snapshot pricing.** Every leg is priced on a *single* pre-batch basket snapshot (the tilt weights
+  are read once, before any leg settles), so the ordering of the legs never changes a rate and the
+  quote `previewRedeemBatch` matches the payout leg-for-leg — the same preview-equals-payout guarantee
+  as single `redeem` (§5.5). `redeem` and `redeemBatch` share the same internal per-leg routine, so a
+  leg pays exactly what the equivalent single `redeem` would at that snapshot.
+- **Solvency-equivalent.** Each leg independently clamps its rate to ≤ 100% and retains the haircut, so
+  a batch can never return more than face and never lowers backing — it is equivalent to a run of
+  single redemptions for solvency purposes.
+- **Distress gate, once.** The distress check (§5.4) runs once, up front: below 99% backing the whole
+  batch reverts `UseRedeemMix` and the holder exits via `redeemMix`. Because redemptions only *raise*
+  backing, a batch that begins in normal mode stays in normal mode through every leg.
+- **Atomic.** Any leg that would revert on its own — unlisted collateral, dust, per-leg slippage
+  (`minOuts[i]`), insufficient pool, or a length mismatch across the three arrays — reverts the entire
+  call, so a batch either settles completely or not at all.
+
+The fee (§5.5) applies per leg exactly as in single `redeem`. `redeemBatch` must be a native engine
+function rather than an external router, because `SumUSD` burns are `MINTER_ROLE`-gated and burn the
+caller with no allowance path — no third-party contract can batch redemptions on a holder's behalf.
+
 ---
 
 ## 6. Over-Collateralization and Solvency

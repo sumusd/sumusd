@@ -63,6 +63,17 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   redemption would round to 0 collateral (dust input), instead of burning SumUSD for nothing. A flavor
   the convex tilt has priced to a rate of *exactly* 0 still returns 0 without reverting (preserves the
   "tilt never gates" liveness property — holders exit via another flavor or `redeemMix`).
+- **Batch redeem (`redeemBatch`).** `redeemBatch(collaterals[], sumUsdAmounts[], minOuts[])` redeems
+  several flavors in one transaction — each leg priced and paid exactly as an individual `redeem`.
+  All legs share **one pre-batch basket snapshot** (`_basketStats` read once), so the leg order never
+  changes a rate and `previewRedeemBatch` matches the payout leg-for-leg (upholds preview == payout).
+  Each leg still clamps to ≤100% and keeps the haircut, so a batch can never return more than face or
+  lower backing — solvency-equivalent to N sequential `redeem` calls. The distress gate is checked
+  **once** up front (redemptions only raise backing, so a batch that starts in normal mode stays there);
+  below the distress line it reverts `UseRedeemMix`. Atomic: any leg reverting (unlisted, dust,
+  slippage, insufficient pool, length mismatch) reverts the whole call. `redeem` and `redeemBatch`
+  share an internal `_redeemOne`; the previews share `_quoteRedeem`. Must be a native engine function
+  (not a router): `SumUSD.burn` is `MINTER_ROLE`-only and burns `msg.sender` with no allowance path.
 - **Deposit peg-band guard.** A deposit reverts (`PriceOutOfBand`) if the collateral's oracle
   price deviates from $1.00 by more than `MAX_DEPOSIT_PRICE_DEVIATION_BPS` (0.5%, a constant).
   Redemptions are deliberately *not* gated by this, so holders can always exit during a depeg.
@@ -108,7 +119,8 @@ Consequences worth internalizing:
 
 - `SumUSD.sol` — the ERC-20 (18 decimals, EIP-2612 permit). Supply is controlled solely by
   `MINTER_ROLE`; the engine holds that role. The token has no collateral logic.
-- `SumUSDEngine.sol` — the vault: `deposit`, `redeem`, `redeemMix` (pro-rata distress exit), `donate`,
+- `SumUSDEngine.sol` — the vault: `deposit`, `redeem`, `redeemBatch` (multi-flavor redeem),
+  `redeemMix` (pro-rata distress exit), `donate`,
   per-collateral `CollateralConfig`
   (`enabled`, cached `decimals`, `redeemRateBps`, `oracle`, `backingExcluded`), and admin setters.
   **There is no global pause** — deposits/redemptions can't be halted wholesale; the only fast lever is

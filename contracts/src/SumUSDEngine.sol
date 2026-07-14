@@ -208,6 +208,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error UseRedeemMix(uint256 ratioBps);
     error NotDistressed(uint256 ratioBps);
     error MinOutLengthMismatch();
+    error BatchLengthMismatch();
     error ZeroCollateralOut(uint256 sumUsdAmount);
     error InvalidRedeemFee(uint16 redeemFeeBps, uint16 feeToRecipientBps);
     error InvalidStalePriceParams(uint32 graceSeconds, uint16 haircutBps);
@@ -285,6 +286,54 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         nonReentrant
         returns (uint256 collateralOut)
     {
+        // Below the distress line, single-flavor (cherry-pick) redemption is disabled to stop the
+        // first-redeemer run; holders exit pro-rata via {redeemMix}.
+        _requireNotDistressed();
+        (uint256 totalUsd, uint256 funded) = _basketStats();
+        collateralOut = _redeemOne(collateral, sumUsdAmount, minCollateralOut, totalUsd, funded);
+    }
+
+    /// @notice Redeem several flavors in one transaction: burn `sumUsdAmounts[i]` for `collaterals[i]`,
+    ///         each priced and paid exactly as an individual {redeem} would be.
+    /// @dev Every leg is priced on ONE pre-batch basket snapshot (`_basketStats` read once), so
+    ///      {previewRedeemBatch} matches the payout leg-for-leg and the ordering of the legs does not
+    ///      change any rate. Each leg still clamps its rate to <= 100% and keeps the haircut, so the batch
+    ///      can never return more than face and never lowers backing (it is solvency-equivalent to N
+    ///      separate {redeem} calls). The distress gate is checked ONCE up front — redemptions only raise
+    ///      backing, so a batch that starts in normal mode stays in it. The whole batch is atomic: any leg
+    ///      that reverts (unlisted, dust, slippage, insufficient pool) reverts the entire call. Use single
+    ///      {redeem} in distress; below the distress line this reverts `UseRedeemMix` (use {redeemMix}).
+    /// @param collaterals Accepted collateral tokens to receive, one per leg.
+    /// @param sumUsdAmounts SumUSD to burn per leg (aligned to `collaterals`).
+    /// @param minOuts Minimum collateral to accept per leg, token decimals (aligned to `collaterals`).
+    /// @return collateralOuts Collateral sent to the caller per leg.
+    function redeemBatch(address[] calldata collaterals, uint256[] calldata sumUsdAmounts, uint256[] calldata minOuts)
+        external
+        nonReentrant
+        returns (uint256[] memory collateralOuts)
+    {
+        uint256 n = collaterals.length;
+        if (n == 0 || sumUsdAmounts.length != n || minOuts.length != n) revert BatchLengthMismatch();
+        _requireNotDistressed();
+        (uint256 totalUsd, uint256 funded) = _basketStats(); // one snapshot prices the whole batch
+        collateralOuts = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            collateralOuts[i] = _redeemOne(collaterals[i], sumUsdAmounts[i], minOuts[i], totalUsd, funded);
+        }
+    }
+
+    /// @dev One redemption leg, shared by {redeem} and {redeemBatch}. Prices `sumUsdAmount` of `collateral`
+    ///      at its live weight-tilt rate over the given basket snapshot (`totalUsd`, `funded`), applies the
+    ///      fee, burns, sends the net to `msg.sender`, and settles the fee. The caller performs the distress
+    ///      gate once (this does not). Reverts on an unlisted collateral, zero amount, dust, slippage, or
+    ///      insufficient pool.
+    function _redeemOne(
+        address collateral,
+        uint256 sumUsdAmount,
+        uint256 minCollateralOut,
+        uint256 totalUsd,
+        uint256 funded
+    ) internal returns (uint256 collateralOut) {
         CollateralConfig memory c = configs[collateral];
         if (address(c.oracle) == address(0)) revert CollateralNotEnabled(collateral); // unlisted
         if (sumUsdAmount == 0) revert ZeroAmount();
@@ -292,13 +341,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         // Warm the last-good cache for the touched flavor (no-op if its feed is currently down).
         _recordPrice(collateral, c.oracle);
 
-        // Below the distress line, single-flavor (cherry-pick) redemption is disabled to stop the
-        // first-redeemer run; holders exit pro-rata via {redeemMix}.
-        uint256 ratioBps = systemCollateralizationRatioBps();
-        if (ratioBps < DISTRESS_RATIO_BPS) revert UseRedeemMix(ratioBps);
-
         uint256 available = IERC20(collateral).balanceOf(address(this));
-        (uint256 totalUsd, uint256 funded) = _basketStats();
 
         // Effective haircut from the weight tilt (priced on the pre-redemption basket). The oracle is
         // read only to weigh the flavor's basket share — it does NOT price the payout. An unpriceable
@@ -330,6 +373,13 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         IERC20(collateral).safeTransfer(msg.sender, collateralOut);
         _settleRedeemFee(collateral, grossOut); // routes the fee portion (best-effort) and emits
         emit Redeemed(msg.sender, collateral, sumUsdAmount, collateralOut);
+    }
+
+    /// @dev Revert if backing is below the distress line — single-flavor {redeem}/{redeemBatch} are
+    ///      disabled there and holders exit pro-rata via {redeemMix}.
+    function _requireNotDistressed() internal view {
+        uint256 ratioBps = systemCollateralizationRatioBps();
+        if (ratioBps < DISTRESS_RATIO_BPS) revert UseRedeemMix(ratioBps);
     }
 
     /// @notice Pro-rata "redeem the mix": burn `sumUsdAmount` and receive `sumUsdAmount / totalSupply`
@@ -515,8 +565,39 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         now — the weight-tilted haircut AND the redemption fee both applied — so the quote
     ///         matches the actual {redeem} payout.
     function previewRedeem(address collateral, uint256 sumUsdAmount) external view returns (uint256) {
-        CollateralConfig memory c = configs[collateral];
         (uint256 totalUsd, uint256 funded) = _basketStats();
+        return _quoteRedeem(collateral, sumUsdAmount, totalUsd, funded);
+    }
+
+    /// @notice Quote {redeemBatch}: the NET collateral each leg returns right now, priced on ONE basket
+    ///         snapshot exactly as {redeemBatch} prices it — so this matches the actual payout leg-for-leg
+    ///         (barring a leg that would revert on chain, e.g. dust or an empty pool).
+    /// @param collaterals Accepted collateral tokens, one per leg.
+    /// @param sumUsdAmounts SumUSD to burn per leg (aligned to `collaterals`).
+    /// @return nets Net collateral each leg would return (token decimals).
+    function previewRedeemBatch(address[] calldata collaterals, uint256[] calldata sumUsdAmounts)
+        external
+        view
+        returns (uint256[] memory nets)
+    {
+        uint256 n = collaterals.length;
+        if (sumUsdAmounts.length != n) revert BatchLengthMismatch();
+        (uint256 totalUsd, uint256 funded) = _basketStats();
+        nets = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            nets[i] = _quoteRedeem(collaterals[i], sumUsdAmounts[i], totalUsd, funded);
+        }
+    }
+
+    /// @dev Net collateral a redemption of `sumUsdAmount` in `collateral` returns over the given basket
+    ///      snapshot — the weight-tilt haircut AND the fee applied. Shared by the redeem previews so a
+    ///      quote can never diverge from the {redeem}/{redeemBatch} payout.
+    function _quoteRedeem(address collateral, uint256 sumUsdAmount, uint256 totalUsd, uint256 funded)
+        internal
+        view
+        returns (uint256)
+    {
+        CollateralConfig memory c = configs[collateral];
         uint256 poolBalance = IERC20(collateral).balanceOf(address(this));
         uint256 effectiveRedeemRateBps = _liveRedeemRateBps(collateral, c, poolBalance, totalUsd, funded);
         uint256 grossOut = _toUnits((sumUsdAmount * effectiveRedeemRateBps) / BPS, c);
