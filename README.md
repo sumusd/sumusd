@@ -41,6 +41,7 @@ contracts/        Foundry project — the protocol
   script/         Deploy + testnet/local bring-up scripts
   test/           Foundry test suite
 WHITEPAPER.md     Protocol specification
+GOVERNANCE.md     Signer runbook (timelock queue/execute, per-op calldata, checklists)
 CLAUDE.md         Codebase guide / conventions
 ```
 
