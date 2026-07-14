@@ -114,7 +114,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     uint256 internal constant MAX_REDEEM_FEE_BPS = 2; // 0.02%
     /// @notice Immutable cap on the stale-price grace window (see {stalePriceGraceSeconds}), so
     ///         governance can never let a collateral be valued at a price older than this.
-    uint256 internal constant MAX_STALE_PRICE_GRACE = 2 days;
+    uint256 internal constant MAX_STALE_PRICE_GRACE = 1 days;
 
     /// @notice Per-collateral risk parameters and pricing.
     struct CollateralConfig {

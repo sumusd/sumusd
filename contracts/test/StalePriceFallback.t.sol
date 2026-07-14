@@ -172,10 +172,10 @@ contract StalePriceFallbackTest is Test {
 
     function test_Rails_And_OnlyOwner() public {
         vm.expectPartialRevert(SumUSDEngine.InvalidStalePriceParams.selector);
-        engine.setStalePriceParams(uint32(2 days + 1), HAIRCUT); // grace over the rail
+        engine.setStalePriceParams(uint32(1 days + 1), HAIRCUT); // grace over the rail
         vm.expectPartialRevert(SumUSDEngine.InvalidStalePriceParams.selector);
         engine.setStalePriceParams(GRACE, uint16(BPS + 1)); // haircut over 100%
-        engine.setStalePriceParams(uint32(2 days), uint16(BPS)); // ok at the rails
+        engine.setStalePriceParams(uint32(1 days), uint16(BPS)); // ok at the rails
 
         vm.prank(makeAddr("rando"));
         vm.expectRevert();

@@ -153,7 +153,7 @@ flavor still revert (peg guard is live-only, never covered by the fallback).
 **Stale-price fallback (`setStalePriceParams`, `refreshPrices`)** fixes the "one dead feed → whole
 system trips into distress" cascade: a transient outage on a large flavor no longer craters the
 backing ratio, because the flavor holds its haircut last-good value for the grace window (railed to
-`MAX_STALE_PRICE_GRACE = 2 days`; `graceSeconds = 0` disables it — the default). The cache
+`MAX_STALE_PRICE_GRACE = 1 day`; `graceSeconds = 0` disables it — the default). The cache
 (`lastGoodPriceWad`/`lastGoodPriceAt`) is warmed on deposit/redeem of that flavor and by the
 permissionless `refreshPrices()`/`refreshPrice(token)` keeper hooks. It applies ONLY to
 backing/tilt valuation, never the peg guard or the par payout, and only engages when there is no
