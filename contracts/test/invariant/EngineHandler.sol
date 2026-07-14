@@ -105,10 +105,19 @@ contract EngineHandler is Test {
             ghostBurned += amount;
         } catch {}
 
-        // Fairness: a pro-rata exit must never REDUCE the backing ratio (floor rounding keeps dust
-        // pooled). Record a violation flag — checked by an invariant — rather than reverting the handler.
-        if (ok && supplyBefore > 0 && sumUsd.totalSupply() > 0) {
-            if (engine.systemCollateralizationRatioBps() < ratioBefore) redeemMixFair = false;
+        // Fairness: a pro-rata exit must never REDUCE the backing ratio — the pool always keeps at
+        // least the redeemer's share (Sum out_i*price_i <= (amount/supply)*totalUsd), so the TRUE ratio
+        // is non-decreasing. The reported ratio is an integer bps of a per-flavor FLOORED valuation
+        // (`totalCollateralValueUsd` sums independently-floored `collateralValueUsd` terms), so that
+        // reading can tick down by at most one wei of value per flavor — i.e. up to
+        // `BPS * numFlavors / supply` bps. This is ~0 at any realistic supply and only widens at dust
+        // supply (the amount the shrinker drives it to); tolerate exactly that bound so the flag tracks a
+        // real economic reduction, not a valuation-floor artifact. Checked by an invariant (not reverted
+        // here) so a handler revert can't be misattributed to it.
+        uint256 supplyAfter = sumUsd.totalSupply();
+        if (ok && supplyBefore > 0 && supplyAfter > 0) {
+            uint256 tolBps = (10_000 * collaterals.length) / supplyAfter + 1;
+            if (engine.systemCollateralizationRatioBps() + tolBps < ratioBefore) redeemMixFair = false;
         }
     }
 
