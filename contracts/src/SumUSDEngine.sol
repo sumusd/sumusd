@@ -112,6 +112,9 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         can impose (on top of the tilt haircut) at 2 bps (0.02%), so no admin can set a punitive
     ///         exit fee. 0 stays valid (no fee). The routable portion is separately capped at `redeemFeeBps`.
     uint256 internal constant MAX_REDEEM_FEE_BPS = 2; // 0.02%
+    /// @notice Immutable cap on the stale-price grace window (see {stalePriceGraceSeconds}), so
+    ///         governance can never let a collateral be valued at a price older than this.
+    uint256 internal constant MAX_STALE_PRICE_GRACE = 2 days;
 
     /// @notice Per-collateral risk parameters and pricing.
     struct CollateralConfig {
@@ -149,6 +152,22 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         unset (`address(0)`), the routed portion also stays in the pool, so no value leaves.
     address public feeRecipient;
 
+    /// @notice Stale-price fallback (anti-distress-on-outage). When a collateral's LIVE feed is
+    ///         unavailable, it is valued for the BACKING/tilt math at its last-good price minus
+    ///         `stalePriceHaircutBps`, but only for `stalePriceGraceSeconds` after that last good read;
+    ///         after the grace window it values at 0 (the fully-conservative default). This stops a
+    ///         *transient* feed outage from cratering `systemCollateralizationRatioBps()` and tripping
+    ///         the whole system into distress. `stalePriceGraceSeconds == 0` disables the fallback.
+    ///         It NEVER covers the deposit peg guard (live-only, fail-closed) or the redemption payout
+    ///         (par, oracle-independent). Owner-settable, railed to `MAX_STALE_PRICE_GRACE`.
+    uint32 public stalePriceGraceSeconds;
+    /// @notice Conservative haircut applied to a last-good price when it is used as the stale fallback.
+    uint16 public stalePriceHaircutBps;
+    /// @notice Last live, non-zero price recorded for a collateral, and when it was recorded. Warmed by
+    ///         deposits/redemptions of that flavor and by the permissionless {refreshPrices} keeper hook.
+    mapping(address token => uint256 priceWad) public lastGoodPriceWad;
+    mapping(address token => uint256 timestamp) public lastGoodPriceAt;
+
     event CollateralListed(address indexed token, uint16 redeemRateBps, address oracle);
     event CollateralUpdated(address indexed token, bool enabled, uint16 redeemRateBps, address oracle);
     event Deposited(address indexed user, address indexed collateral, uint256 amountIn, uint256 sumUsdOut);
@@ -162,6 +181,8 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     event RedeemFeeUpdated(uint16 redeemFeeBps, uint16 feeToRecipientBps);
     event FeeRecipientUpdated(address indexed feeRecipient);
     event RedeemFeePaid(address indexed collateral, address indexed recipient, uint256 toRecipient, uint256 retained);
+    event StalePriceParamsUpdated(uint32 graceSeconds, uint16 haircutBps);
+    event PriceRecorded(address indexed token, uint256 priceWad, uint256 at);
 
     error CollateralNotEnabled(address token);
     error ZeroAmount();
@@ -181,6 +202,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error MinOutLengthMismatch();
     error ZeroCollateralOut(uint256 sumUsdAmount);
     error InvalidRedeemFee(uint16 redeemFeeBps, uint16 feeToRecipientBps);
+    error InvalidStalePriceParams(uint32 graceSeconds, uint16 haircutBps);
 
     /// @param admin   Owner of the engine (risk admin / governance).
     /// @param _sumUsd The SumUSD token. The engine must be granted MINTER_ROLE on it separately.
@@ -222,8 +244,12 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         // Use the actually-received amount so fee-on-transfer tokens can never over-mint.
         uint256 received = IERC20(collateral).balanceOf(address(this)) - balBefore;
 
-        // Reject mints when the collateral has drifted too far from its $1.00 peg.
-        _requirePeggedForDeposit(collateral, c.oracle.getPriceWad(collateral));
+        // Reject mints when the collateral has drifted too far from its $1.00 peg. The peg guard is
+        // live-only (fail-closed): an unpriceable feed reverts here and is never covered by the
+        // stale-price fallback. Past the guard the price is fresh and in-band, so cache it as last-good.
+        uint256 priceWad = c.oracle.getPriceWad(collateral);
+        _requirePeggedForDeposit(collateral, priceWad);
+        _writeLastGood(collateral, priceWad);
 
         minted = _normalizeTo18(received, c); // raw 1:1 unit swap, decimal-normalized; oracle does not price the mint
         if (minted < minSumUsdOut) revert SlippageExceeded(minted, minSumUsdOut);
@@ -254,6 +280,9 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         CollateralConfig memory c = configs[collateral];
         if (address(c.oracle) == address(0)) revert CollateralNotEnabled(collateral); // unlisted
         if (sumUsdAmount == 0) revert ZeroAmount();
+
+        // Warm the last-good cache for the touched flavor (no-op if its feed is currently down).
+        _recordPrice(collateral, c.oracle);
 
         // Below the distress line, single-flavor (cherry-pick) redemption is disabled to stop the
         // first-redeemer run; holders exit pro-rata via {redeemMix}.
@@ -370,6 +399,24 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit Donated(msg.sender, collateral, received);
     }
 
+    /// @notice Refresh the cached last-good price for every listed collateral whose feed currently
+    ///         reads fresh. Permissionless keeper hook: keeping the cache warm extends how long the
+    ///         stale-price fallback ({stalePriceGraceSeconds}) can cover a feed outage. A collateral
+    ///         whose feed is currently down is simply skipped (no stale write).
+    function refreshPrices() external {
+        uint256 len = collateralList.length;
+        for (uint256 i; i < len; ++i) {
+            address token = collateralList[i];
+            _recordPrice(token, configs[token].oracle);
+        }
+    }
+
+    /// @notice Refresh the cached last-good price for a single listed collateral (cheaper targeted
+    ///         keeper hook). No-op if the feed is currently down or the token is unlisted.
+    function refreshPrice(address collateral) external {
+        _recordPrice(collateral, configs[collateral].oracle);
+    }
+
     // ---------------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------------
@@ -398,16 +445,29 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         return collateralList;
     }
 
-    /// @notice USD value (18-decimal WAD) of the pool's balance of one collateral. Returns 0 if the
-    ///         collateral is unlisted or its oracle is unavailable (reverts or returns 0) — so a
-    ///         single broken feed contributes nothing rather than bricking every basket-wide loop
-    ///         (backing ratio, weight tilt, `poolNeeds`).
+    /// @notice USD value (18-decimal WAD) of the pool's balance of one collateral, using the valuation
+    ///         price (live feed, else the stale-price fallback within its grace window, else 0). Returns
+    ///         0 if the collateral is unlisted or has no usable price — so a broken feed contributes
+    ///         nothing (or its haircut last-good) rather than bricking every basket-wide loop.
     function collateralValueUsd(address collateral) public view returns (uint256) {
         CollateralConfig memory c = configs[collateral];
         if (address(c.oracle) == address(0)) return 0;
-        (uint256 priceWad, bool ok) = _tryPriceWad(collateral, c.oracle);
-        if (!ok) return 0;
+        uint256 priceWad = _valuationPriceWad(collateral, c.oracle);
+        if (priceWad == 0) return 0;
         return _toUsdAt(IERC20(collateral).balanceOf(address(this)), c, priceWad);
+    }
+
+    /// @notice The raw current oracle read for `collateral`: the live price (WAD) and whether the feed
+    ///         answered. `ok == false` means the feed is currently unavailable (reverting or 0). Useful
+    ///         for surfacing feed health in a UI.
+    function livePriceWad(address collateral) external view returns (uint256 priceWad, bool ok) {
+        return _tryPriceWad(collateral, configs[collateral].oracle);
+    }
+
+    /// @notice The price actually used to VALUE `collateral` for backing/tilt right now: the live feed
+    ///         if available, else the haircut last-good price within the grace window, else 0.
+    function valuationPriceWad(address collateral) external view returns (uint256) {
+        return _valuationPriceWad(collateral, configs[collateral].oracle);
     }
 
     /// @notice Total USD value (WAD) of the entire collateral basket.
@@ -622,6 +682,20 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit FeeRecipientUpdated(newRecipient);
     }
 
+    /// @notice Configure the stale-price fallback: `graceSeconds` is how long a collateral whose live
+    ///         feed has failed keeps being valued (for backing/tilt only) at its last-good price minus
+    ///         `haircutBps`; after that it values at 0. `graceSeconds = 0` disables the fallback (the
+    ///         fully-conservative default). Owner-only (96h timelock); railed to `MAX_STALE_PRICE_GRACE`
+    ///         and a haircut <= 100%. Reference config: 6 hours / 100 bps.
+    function setStalePriceParams(uint32 graceSeconds, uint16 haircutBps) external onlyOwner {
+        if (graceSeconds > MAX_STALE_PRICE_GRACE || haircutBps > BPS) {
+            revert InvalidStalePriceParams(graceSeconds, haircutBps);
+        }
+        stalePriceGraceSeconds = graceSeconds;
+        stalePriceHaircutBps = haircutBps;
+        emit StalePriceParamsUpdated(graceSeconds, haircutBps);
+    }
+
     // ---------------------------------------------------------------------
     // Internal math
     // ---------------------------------------------------------------------
@@ -674,6 +748,34 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         try oracle.getPriceWad(collateral) returns (uint256 p) {
             if (p != 0) (priceWad, ok) = (p, true);
         } catch {}
+    }
+
+    /// @dev Price used to VALUE a collateral for backing/tilt: the live feed if it answers; otherwise,
+    ///      if the stale-price fallback is enabled and the last-good price is within the grace window,
+    ///      that price minus `stalePriceHaircutBps`; otherwise 0. Never used for the deposit peg guard
+    ///      (live-only) or the redemption payout (par). `BPS - stalePriceHaircutBps` cannot underflow —
+    ///      the setter rails `stalePriceHaircutBps <= BPS`.
+    function _valuationPriceWad(address token, IPriceOracle oracle) internal view returns (uint256) {
+        (uint256 live, bool ok) = _tryPriceWad(token, oracle);
+        if (ok) return live;
+        uint256 grace = stalePriceGraceSeconds;
+        if (grace == 0) return 0;
+        uint256 at = lastGoodPriceAt[token];
+        if (at == 0 || block.timestamp - at > grace) return 0;
+        return (lastGoodPriceWad[token] * (BPS - stalePriceHaircutBps)) / BPS;
+    }
+
+    /// @dev Record a token's live price as its last-good, only if the feed reads fresh and non-zero.
+    function _recordPrice(address token, IPriceOracle oracle) internal {
+        (uint256 priceWad, bool ok) = _tryPriceWad(token, oracle);
+        if (ok) _writeLastGood(token, priceWad);
+    }
+
+    /// @dev Write the last-good price cache for `token`. `priceWad` must already be a known-fresh read.
+    function _writeLastGood(address token, uint256 priceWad) internal {
+        lastGoodPriceWad[token] = priceWad;
+        lastGoodPriceAt[token] = block.timestamp;
+        emit PriceRecorded(token, priceWad, block.timestamp);
     }
 
     /// @dev Convert a token amount (in its own decimals) to USD value (18-decimal WAD) at `priceWad`.

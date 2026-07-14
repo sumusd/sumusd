@@ -133,13 +133,26 @@ Production implementations are expected to wrap a robust feed (e.g. Chainlink) a
 stale or invalid rounds. All engine valuation math normalizes through this WAD.
 
 The engine reads the oracle **defensively** (`_tryPriceWad`, a `try/catch`): if a feed reverts or
-returns 0, that collateral is valued at **0** rather than reverting the call. So a single broken
-feed cannot brick the basket-wide loops (backing ratio, weight tilt, `poolNeeds`); it just drops
-that collateral to zero backing/weight (conservative — may halt minting if it is a large share),
-while `redeem` of the affected flavor falls back to its flat base rate at par so holders can still
-exit. The on-chain quotes (`currentRedeemRateBps`, `previewRedeem`) report that same base-rate
-fallback, so a quote never diverges from the actual payout. (A deposit of a flavor whose feed is
-down still reverts — it can't be peg-checked.)
+returns 0, the call is not bricked. So a single broken feed cannot halt the basket-wide loops
+(backing ratio, weight tilt, `poolNeeds`), and `redeem` of the affected flavor falls back to its
+flat base rate at par so holders can still exit. The on-chain quotes (`currentRedeemRateBps`,
+`previewRedeem`) report that same base-rate fallback, so a quote never diverges from the actual
+payout. (A deposit of a flavor whose feed is down still reverts — it can't be peg-checked.)
+
+**Stale-price fallback (anti-distress-on-outage).** Valuing an unpriceable flavor at 0 is fully
+conservative, but it means a *transient* feed outage on a large flavor can crater the backing ratio
+and trip the whole system into distress (§5.4) even though nothing is actually insolvent. To bound
+that, the engine can value a flavor whose live feed has failed at its **last-good price minus a
+haircut**, for a governance-set grace window (`stalePriceGraceSeconds`, railed to
+`MAX_STALE_PRICE_GRACE`); past the window it reverts to 0. The last-good price is only ever a value
+the trusted oracle actually reported — warmed on every deposit/redeem of that flavor and by a
+permissionless `refreshPrices()` keeper hook — so the fallback can never invent a price, only hold a
+recent real one a little longer. It applies **only to the backing/tilt valuation**, never to the
+deposit peg guard (still live-only, fail-closed) or the redemption payout (still par). It is
+disabled by default (`stalePriceGraceSeconds = 0`, the fully-conservative behavior) and opt-in via
+governance. Crucially, it only engages when there is *no* live price at all; a live feed reporting a
+genuinely low price (a real de-peg) is used as-is, so distress still triggers correctly on actual
+insolvency. `livePriceWad` / `valuationPriceWad` / `lastGoodPriceAt` surface feed health for a UI.
 
 It is important to understand *where the oracle is and is not used*:
 

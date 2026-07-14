@@ -97,6 +97,11 @@ contract SetupSepolia is Script {
         engine.setRedeemFee(2, 1);
         engine.setFeeRecipient(admin);
 
+        // Stale-price fallback: if a feed goes down, value the flavor at its last-good price minus 1%
+        // for up to 6 hours (for backing/tilt only), so a transient outage doesn't trip the whole
+        // system into distress. A keeper can call engine.refreshPrices() to keep the cache warm.
+        engine.setStalePriceParams(6 hours, 100);
+
         // Faucet the deployer so the dapp can be exercised right away.
         flavorA.mint(admin, 1_000_000e6);
         flavorB.mint(admin, 1_000_000e6);

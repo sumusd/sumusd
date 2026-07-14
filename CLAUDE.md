@@ -143,12 +143,23 @@ can't grow unbounded; `removeCollateral` de-lists a **disabled + zero-balance** 
 (swap-and-pop, config cleared) to free a slot. (To retire one still holding a balance: re-enable →
 let it be redeemed to zero → disable → remove.)
 
-**Oracle resilience:** `collateralValueUsd` reads the oracle through `_tryPriceWad` (try/catch) and
-returns **0** if a feed reverts or returns 0, so one broken feed can't brick the basket-wide loops
-(`totalCollateralValueUsd`, `_basketStats`, `poolNeeds`). Effect of a dead feed: that collateral
-drops to 0 backing/weight (conservative — may halt minting if it's a big chunk), and `redeem` of
-that flavor falls back to its flat base rate at par so holders can still exit. Deposits of a
-dead-feed flavor still revert (its peg-band guard can't price it).
+**Oracle resilience:** `collateralValueUsd` prices a collateral via `_valuationPriceWad`: the live
+feed (`_tryPriceWad`, try/catch) if available; else, if the **stale-price fallback** is enabled, the
+last-good price minus `stalePriceHaircutBps` for up to `stalePriceGraceSeconds` after the last good
+read; else **0**. So one broken feed can't brick the basket-wide loops. `redeem` of a dead-feed
+flavor falls back to its flat base rate at par so holders can still exit; deposits of a dead-feed
+flavor still revert (peg guard is live-only, never covered by the fallback).
+
+**Stale-price fallback (`setStalePriceParams`, `refreshPrices`)** fixes the "one dead feed → whole
+system trips into distress" cascade: a transient outage on a large flavor no longer craters the
+backing ratio, because the flavor holds its haircut last-good value for the grace window (railed to
+`MAX_STALE_PRICE_GRACE = 2 days`; `graceSeconds = 0` disables it — the default). The cache
+(`lastGoodPriceWad`/`lastGoodPriceAt`) is warmed on deposit/redeem of that flavor and by the
+permissionless `refreshPrices()`/`refreshPrice(token)` keeper hooks. It applies ONLY to
+backing/tilt valuation, never the peg guard or the par payout, and only engages when there is no
+live price (a live low price = real de-peg is used as-is, so distress still triggers correctly).
+Views `livePriceWad`/`valuationPriceWad`/`lastGoodPriceAt` surface feed health (the website uses
+them). Owner-settable; reference config 6h / 100 bps (set in `SetupSepolia`).
 
 The **one fast lever** is the `guardian` (a separate fast multisig, set via `setGuardian`,
 owner-only): it can `freezeCollateral(token)` instantly to disable a single misbehaving collateral
