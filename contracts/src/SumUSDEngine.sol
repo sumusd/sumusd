@@ -126,6 +126,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         uint8 decimals; // cached token decimals, read once on listing
         uint16 redeemRateBps; // base collateral value returned per 1 SumUSD on redemption; <= BPS => over-collateralized
         IPriceOracle oracle; // USD price feed (18-decimal WAD)
+        bool backingExcluded; // "siloed": value not counted toward backing/tilt (see setCollateralBackingExcluded)
     }
 
     /// @notice The aggregated stablecoin minted/burned by this engine.
@@ -182,6 +183,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     event GuardianUpdated(address indexed guardian);
     event CollateralFrozen(address indexed token, address indexed by);
     event CollateralRemoved(address indexed token);
+    event CollateralBackingExcludedSet(address indexed token, bool excluded);
     event RedeemFeeUpdated(uint16 redeemFeeBps, uint16 feeToRecipientBps);
     event FeeRecipientUpdated(address indexed feeRecipient);
     event RedeemFeePaid(address indexed collateral, address indexed recipient, uint256 toRecipient, uint256 retained);
@@ -457,10 +459,15 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         nothing (or its haircut last-good) rather than bricking every basket-wide loop.
     function collateralValueUsd(address collateral) public view returns (uint256) {
         CollateralConfig memory c = configs[collateral];
-        if (address(c.oracle) == address(0)) return 0;
-        uint256 priceWad = _valuationPriceWad(collateral, c.oracle);
-        if (priceWad == 0) return 0;
-        return _toUsdAt(IERC20(collateral).balanceOf(address(this)), c, priceWad);
+        if (c.backingExcluded) return 0; // de-backed / siloed: not counted toward backing or the tilt
+        return _valueUsd(collateral, c);
+    }
+
+    /// @notice The pool's USD value of `collateral` IGNORING any backing exclusion — the real value
+    ///         sitting in the pool. Equals {collateralValueUsd} unless the flavor is de-backed, in which
+    ///         case this still reports the stranded value (for UIs) while the backing math counts 0.
+    function rawCollateralValueUsd(address collateral) external view returns (uint256) {
+        return _valueUsd(collateral, configs[collateral]);
     }
 
     /// @notice The raw current oracle read for `collateral`: the live price (WAD) and whether the feed
@@ -633,6 +640,24 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         }
         delete configs[collateral];
         emit CollateralRemoved(collateral);
+    }
+
+    /// @notice Exclude (or re-include) a listed collateral from the backing/solvency and tilt math —
+    ///         "siloing" a permanently-inaccessible flavor (e.g. one whose issuer has blacklisted the
+    ///         engine). While excluded, its value contributes 0 to `totalCollateralValueUsd` and drops
+    ///         out of the weight tilt, so `systemCollateralizationRatioBps()` reflects only redeemable
+    ///         value: distress then triggers HONESTLY if the loss pushes backing below the floor, and
+    ///         `redeemMix` shares the shortfall pro-rata instead of leaving it to the last holders.
+    /// @dev The flavor stays listed and its balance stays pooled — `redeemMix` still offers its (stuck)
+    ///      slice, so if it ever becomes transferable again the value flows back out; re-include it then.
+    ///      `rawCollateralValueUsd` still reports the stranded value for UIs. Owner-only (96h timelock),
+    ///      because this can trip distress and holders must get their exit window. Orthogonal to a
+    ///      guardian {freezeCollateral} (which also stops deposits + is instant): use both to fully silo.
+    function setCollateralBackingExcluded(address collateral, bool excluded) external onlyOwner {
+        CollateralConfig storage c = configs[collateral];
+        if (address(c.oracle) == address(0)) revert CollateralNotEnabled(collateral); // must be listed
+        c.backingExcluded = excluded;
+        emit CollateralBackingExcludedSet(collateral, excluded);
     }
 
     /// @notice Set (or clear, with `address(0)`) the guardian that can instantly freeze a collateral.
@@ -809,6 +834,15 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     /// @dev Convert a token amount (in its own decimals) to USD value (18-decimal WAD) at `priceWad`.
     function _toUsdAt(uint256 amount, CollateralConfig memory c, uint256 priceWad) internal pure returns (uint256) {
         return (amount * priceWad) / (10 ** c.decimals);
+    }
+
+    /// @dev Raw pool USD value of `collateral` (ignoring the backing-exclusion flag): 0 if unlisted or
+    ///      unpriceable, else pooled balance valued at the valuation price. Shared by the two value views.
+    function _valueUsd(address collateral, CollateralConfig memory c) internal view returns (uint256) {
+        if (address(c.oracle) == address(0)) return 0;
+        uint256 priceWad = _valuationPriceWad(collateral, c.oracle);
+        if (priceWad == 0) return 0;
+        return _toUsdAt(IERC20(collateral).balanceOf(address(this)), c, priceWad);
     }
 
     /// @dev One pass over the basket for the weight tilt: total USD value and the count of

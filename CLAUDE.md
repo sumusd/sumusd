@@ -110,14 +110,23 @@ Consequences worth internalizing:
   `MINTER_ROLE`; the engine holds that role. The token has no collateral logic.
 - `SumUSDEngine.sol` — the vault: `deposit`, `redeem`, `redeemMix` (pro-rata distress exit), `donate`,
   per-collateral `CollateralConfig`
-  (`enabled`, cached `decimals`, `redeemRateBps`, `oracle`), and admin setters. **There is no
-  global pause** — deposits/redemptions can't be halted wholesale; the only fast lever is a
-  `guardian` that can `freezeCollateral` (disable one collateral) instantly. A frozen collateral is
+  (`enabled`, cached `decimals`, `redeemRateBps`, `oracle`, `backingExcluded`), and admin setters.
+  **There is no global pause** — deposits/redemptions can't be halted wholesale; the only fast lever is
+  a `guardian` that can `freezeCollateral` (disable one collateral) instantly. A frozen collateral is
   blocked from **deposits** and excluded from the **tilt weight math** (`_basketStats` counts only
   `enabled`), but still counts in `totalCollateralValueUsd` (backing) and **stays redeemable at its
   base rate** — so freezing can never trap holders (`redeem` only rejects *unlisted* collateral).
   Uses `Ownable2Step`, `ReentrancyGuard`, `SafeERC20`; reads actual received balance to stay safe
   against fee-on-transfer tokens.
+- **De-back / silo (`setCollateralBackingExcluded`, owner/timelock).** For a permanently-inaccessible
+  flavor (e.g. issuer blacklisted the engine so its balance is stuck but `balanceOf`/oracle still read
+  normally): sets `CollateralConfig.backingExcluded`, which makes `collateralValueUsd` return 0 →
+  drops the flavor from `totalCollateralValueUsd` (backing/mint guard/distress) AND the tilt (via
+  `_basketStats`). So the ratio reflects only redeemable value and distress triggers HONESTLY, instead
+  of the ratio lying and handing the loss to the last redeemers. The flavor stays listed + pooled, so
+  `redeemMix` still shares its (skipped) slice pro-rata; `rawCollateralValueUsd` still reports the
+  stranded value. Reversible. Orthogonal to `freezeCollateral` (fast/exposure vs slow/accounting); a
+  permanent blacklist warrants both. This is the fix for backlog #7.
 - `ImmutableTimelock.sol` — minimal timelock with an **`immutable DELAY`** (no `setDelay`, no
   bypass). Intended as the engine's owner: every `setCollateral`/`setTiltSlopeBps` call must be
   `queue`d and wait the delay before `execute`. `renounceExecutor()` freezes the engine forever.

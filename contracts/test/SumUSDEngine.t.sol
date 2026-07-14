@@ -492,8 +492,8 @@ contract SumUSDEngineTest is Test {
         engine.setCollateral(address(flavorA), true, 9500, oracle); // exactly 95% floor
         engine.setCollateral(address(flavorB), true, uint16(BPS), oracle); // exactly 100% ceiling
         vm.stopPrank();
-        (,, uint16 rA,) = engine.configs(address(flavorA));
-        (,, uint16 rB,) = engine.configs(address(flavorB));
+        (,, uint16 rA,,) = engine.configs(address(flavorA));
+        (,, uint16 rB,,) = engine.configs(address(flavorB));
         assertEq(rA, 9500);
         assertEq(rB, uint16(BPS));
     }
@@ -531,7 +531,7 @@ contract SumUSDEngineTest is Test {
         // Guardian freezes C instantly.
         vm.prank(guardian);
         engine.freezeCollateral(address(flavorC));
-        (bool enabledC,,,) = engine.configs(address(flavorC));
+        (bool enabledC,,,,) = engine.configs(address(flavorC));
         assertFalse(enabledC, "C frozen");
 
         // Frozen C can no longer be DEPOSITED...
@@ -601,7 +601,7 @@ contract SumUSDEngineTest is Test {
 
         vm.prank(owner);
         engine.setCollateralEnabled(address(flavorA), true);
-        (bool enabledA,,,) = engine.configs(address(flavorA));
+        (bool enabledA,,,,) = engine.configs(address(flavorA));
         assertTrue(enabledA, "owner re-enabled");
     }
 
@@ -688,7 +688,7 @@ contract SumUSDEngineTest is Test {
         MockERC20 t18 = new MockERC20("Eighteen", "T18", 18); // exactly at the rail
         vm.prank(owner);
         engine.setCollateral(address(t18), true, 9900, oracle);
-        (, uint8 dec,,) = engine.configs(address(t18));
+        (, uint8 dec,,,) = engine.configs(address(t18));
         assertEq(dec, 18, "18-decimal token listed and cached");
     }
 

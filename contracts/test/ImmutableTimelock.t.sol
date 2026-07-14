@@ -64,7 +64,7 @@ contract ImmutableTimelockTest is Test {
         vm.prank(gov);
         timelock.execute(address(engine), data, bytes32(0));
 
-        (bool enabled,, uint16 rate,) = engine.configs(address(flavorA));
+        (bool enabled,, uint16 rate,,) = engine.configs(address(flavorA));
         assertTrue(enabled);
         assertEq(rate, 9900, "param change landed only after the delay");
     }

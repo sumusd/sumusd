@@ -607,10 +607,27 @@ The engine's owner can:
 - tune the imbalance sensitivity (`setTiltSlopeBps`);
 - set the redemption fee and its split (`setRedeemFee`, railed to `MAX_REDEEM_FEE_BPS`) and the fee
   recipient (`setFeeRecipient`);
+- "silo" a permanently-inaccessible flavor (`setCollateralBackingExcluded`, below);
 - set the guardian (`setGuardian`).
 
 That is the entire privileged surface. Notably, **there is no global pause** — no admin can halt
 deposits or redemptions wholesale; holders can always exit.
+
+**De-backing a stuck flavor.** A custodial stablecoin issuer can blacklist the engine, permanently
+freezing that flavor's balance in the pool: it can no longer be transferred out, yet its `balanceOf`
+and oracle price still read normally, so it keeps counting toward backing and the collateralization
+ratio silently overstates what is actually redeemable. Left unaddressed, that lets early redeemers
+exit through the healthy flavors at par while the last holders are stranded with the inaccessible
+remainder — the very first-redeemer advantage distress mode exists to prevent, except distress never
+triggers because the ratio still looks healthy. `setCollateralBackingExcluded(token, true)` fixes
+this by *siloing* the flavor: its value contributes 0 to `totalCollateralValueUsd` and it drops out
+of the weight tilt, so the ratio reflects only redeemable value and distress engages honestly if the
+loss warrants it. The flavor stays listed and its balance stays pooled, so `redeemMix` still offers
+its (skipped) slice and shares the shortfall pro-rata across all holders; `rawCollateralValueUsd`
+still surfaces the stranded value for transparency. It is owner-only (so it waits the timelock, since
+it can trip distress and holders deserve the exit window) and reversible if the blacklist ever lifts.
+It is the honest-accounting counterpart to the guardian's `freezeCollateral` (which stops new
+exposure instantly); a permanent blacklist warrants both.
 
 **Guardian (the one fast lever).** A separate `guardian` address (a fast multisig, set by the
 owner) can call `freezeCollateral(token)` to instantly disable a *single* collateral. This is the
