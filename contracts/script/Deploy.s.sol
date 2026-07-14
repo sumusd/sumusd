@@ -5,16 +5,27 @@ import {Script, console2} from "forge-std/Script.sol";
 import {SumUSD} from "../src/SumUSD.sol";
 import {SumUSDEngine} from "../src/SumUSDEngine.sol";
 import {ImmutableTimelock} from "../src/ImmutableTimelock.sol";
+import {ChainlinkOracleAdapter} from "../src/oracles/ChainlinkOracleAdapter.sol";
+import {MedianOracleAdapter} from "../src/oracles/MedianOracleAdapter.sol";
 
-/// @notice Deploys the SumUSD token, engine, and an {ImmutableTimelock} (96h immutable delay), wires
-///         the engine as the sole minter, and hands engine ownership to the timelock so that all
-///         future parameter changes must clear the delay.
+/// @notice Deploys the SumUSD token, engine, an {ImmutableTimelock} (96h immutable delay), and the
+///         oracle stack (a {MedianOracleAdapter} over two {ChainlinkOracleAdapter} providers), wires
+///         the engine as the sole minter, and hands engine + oracle ownership to the timelock so that
+///         all future parameter changes must clear the delay.
 ///
-/// @dev Collateral listing (`setCollateral`) is intentionally a follow-up governance action so
-///      production token/oracle addresses are not hardcoded here. Ownership transfer is two-step
-///      (`Ownable2Step`): this script *offers* ownership to the timelock; the GOVERNANCE multisig
-///      must then complete it by queuing `acceptOwnership()` on the engine through the timelock and
-///      executing it after the delay. After that the deployer EOA has no power over the engine.
+/// @dev Collateral listing (`setCollateral`) and oracle feed/source configuration are intentionally
+///      follow-up governance actions so production token/feed addresses are not hardcoded here.
+///      Engine ownership transfer is two-step (`Ownable2Step`): this script *offers* ownership to the
+///      timelock; the GOVERNANCE multisig must then complete it by queuing `acceptOwnership()` on the
+///      engine through the timelock and executing it after the delay. After that the deployer EOA has
+///      no power over the engine.
+///
+///      Oracle ownership: the oracle adapters are deployed OWNED BY THE TIMELOCK FROM CONSTRUCTION
+///      (their `Ownable` initial owner is the timelock), so the deployer EOA never controls them. An
+///      un-timelocked oracle owner could reprice collateral or swap feeds instantly — as dangerous as
+///      an un-timelocked mint key — so, like the token admin, feed/source config is timelocked from
+///      block one. Governance configures `setFeed`/`setSources` and lists collateral through the
+///      timelock afterward. (Asserted below.)
 ///
 ///      Token admin (mint authority): `SumUSD.DEFAULT_ADMIN_ROLE` controls who holds `MINTER_ROLE`,
 ///      i.e. who can mint SumUSD out of thin air. Leaving it on the deployer EOA would be an
@@ -32,7 +43,17 @@ import {ImmutableTimelock} from "../src/ImmutableTimelock.sol";
 ///   GUARDIAN   — fast brake that can freeze a single collateral. Defaults to the broadcaster.
 ///   DELAY      — timelock delay in seconds (default 345600 = 96h).
 contract Deploy is Script {
-    function run() external returns (SumUSD sumUsd, SumUSDEngine engine, ImmutableTimelock timelock) {
+    function run()
+        external
+        returns (
+            SumUSD sumUsd,
+            SumUSDEngine engine,
+            ImmutableTimelock timelock,
+            MedianOracleAdapter oracle,
+            ChainlinkOracleAdapter provider1,
+            ChainlinkOracleAdapter provider2
+        )
+    {
         address governance = vm.envOr("GOVERNANCE", msg.sender);
         address guardian = vm.envOr("GUARDIAN", msg.sender);
         uint256 delay = vm.envOr("DELAY", uint256(96 hours));
@@ -55,22 +76,36 @@ contract Deploy is Script {
         // governance completes the hand-off via acceptOwnership() after the delay.
         engine.setGuardian(guardian);
         engine.transferOwnership(address(timelock));
+
+        // Oracle stack, owned by the timelock from construction (the deployer never controls it), so
+        // feed/source configuration is timelocked from block one. Two Chainlink providers under a
+        // median; governance wires setFeed/setSources and lists collateral afterward via the timelock.
+        provider1 = new ChainlinkOracleAdapter(address(timelock));
+        provider2 = new ChainlinkOracleAdapter(address(timelock));
+        oracle = new MedianOracleAdapter(address(timelock));
         vm.stopBroadcast();
 
-        // Fail the deploy loudly if the mint authority did not end up fully behind the timelock.
+        // Fail the deploy loudly if the mint authority or the oracle owners did not end up behind the
+        // timelock.
         require(!sumUsd.hasRole(adminRole, deployer), "Deploy: deployer still token admin");
         require(sumUsd.hasRole(adminRole, address(timelock)), "Deploy: timelock not token admin");
         require(sumUsd.hasRole(sumUsd.MINTER_ROLE(), address(engine)), "Deploy: engine not minter");
+        require(oracle.owner() == address(timelock), "Deploy: median oracle not timelock-owned");
+        require(provider1.owner() == address(timelock), "Deploy: provider1 not timelock-owned");
+        require(provider2.owner() == address(timelock), "Deploy: provider2 not timelock-owned");
 
         console2.log("SumUSD:           ", address(sumUsd));
         console2.log("SumUSDEngine:     ", address(engine));
         console2.log("ImmutableTimelock:", address(timelock));
+        console2.log("MedianOracle:     ", address(oracle));
+        console2.log("Provider1 (CL):   ", address(provider1));
+        console2.log("Provider2 (CL):   ", address(provider2));
         console2.log("Timelock executor:", governance);
         console2.log("Guardian:         ", guardian);
         console2.log("Timelock delay(s):", delay);
         console2.log("");
-        console2.log("Token admin (mint authority): now the timelock; deployer renounced.");
-        console2.log("Next: governance queues+executes engine.acceptOwnership() via the timelock");
-        console2.log("to complete the ownership hand-off.");
+        console2.log("Token admin + all oracle adapters: now the timelock; deployer renounced.");
+        console2.log("Next (all via the timelock): engine.acceptOwnership(); provider setFeed(s);");
+        console2.log("median setSources; then engine.setCollateral per flavor.");
     }
 }

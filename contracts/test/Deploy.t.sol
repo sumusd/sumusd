@@ -5,6 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {SumUSD} from "../src/SumUSD.sol";
 import {SumUSDEngine} from "../src/SumUSDEngine.sol";
 import {ImmutableTimelock} from "../src/ImmutableTimelock.sol";
+import {ChainlinkOracleAdapter} from "../src/oracles/ChainlinkOracleAdapter.sol";
+import {MedianOracleAdapter} from "../src/oracles/MedianOracleAdapter.sol";
 
 /// @notice Regression cover for the "un-timelocked god-mode mint key" finding. This mirrors the exact
 ///         role wiring in `Deploy.s.sol` (grant token admin to the timelock, then renounce the
@@ -21,6 +23,9 @@ contract DeployTest is Test {
     SumUSD internal sumUsd;
     SumUSDEngine internal engine;
     ImmutableTimelock internal timelock;
+    MedianOracleAdapter internal oracle;
+    ChainlinkOracleAdapter internal provider1;
+    ChainlinkOracleAdapter internal provider2;
 
     address internal deployer = makeAddr("deployer");
     address internal governance = makeAddr("governance");
@@ -43,6 +48,12 @@ contract DeployTest is Test {
 
         engine.setGuardian(guardian);
         engine.transferOwnership(address(timelock));
+
+        // Oracle stack deployed OWNED BY THE TIMELOCK (initial owner = timelock), so the deployer never
+        // controls feed/source config.
+        oracle = new MedianOracleAdapter(address(timelock));
+        provider1 = new ChainlinkOracleAdapter(address(timelock));
+        provider2 = new ChainlinkOracleAdapter(address(timelock));
         // ------------------------------------------------------------------------------------------
         vm.stopPrank();
 
@@ -65,6 +76,21 @@ contract DeployTest is Test {
         // Two-step transfer: the deployer is still owner until the timelock accepts, but the pending
         // owner must be the timelock so governance can complete the hand-off.
         assertEq(engine.pendingOwner(), address(timelock), "timelock not pending owner");
+    }
+
+    function test_Deploy_OracleAdaptersTimelockOwned() public view {
+        // Every oracle adapter is owned by the timelock from construction, so feed/source config is
+        // timelocked and no hot EOA can reprice collateral.
+        assertEq(oracle.owner(), address(timelock), "median oracle not timelock-owned");
+        assertEq(provider1.owner(), address(timelock), "provider1 not timelock-owned");
+        assertEq(provider2.owner(), address(timelock), "provider2 not timelock-owned");
+    }
+
+    function test_Deploy_DeployerCannotConfigureOracle() public {
+        // The oracle owner is the timelock, so no EOA (the deployer included) can set feeds/sources.
+        vm.prank(deployer);
+        vm.expectRevert();
+        provider1.setFeed(makeAddr("tok"), makeAddr("agg"), 1 hours, 0.9e18, 1.1e18);
     }
 
     /// @dev The core property: no EOA can grant itself MINTER_ROLE post-deploy, so no hot key can mint
