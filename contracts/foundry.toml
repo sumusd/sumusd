@@ -11,6 +11,11 @@ remappings = [
 ]
 fs_permissions = [{ access = "read", path = "./" }]
 
+[invariant]
+runs = 96
+depth = 48
+fail_on_revert = false
+
 [fmt]
 line_length = 120
 tab_width = 4
