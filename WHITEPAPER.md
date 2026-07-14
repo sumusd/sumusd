@@ -179,6 +179,18 @@ concentration, reserve composition, secondary-market liquidity, and the nature o
 so each whitelisted flavor carries its own per-collateral risk parameters (§5, §8). Adding or
 removing a flavor is a governance action.
 
+**Eligibility requirements and the listing probe.** Because the engine accounts for collateral by
+its on-chain `balanceOf` and treats one unit as exactly one dollar, a listed token must be
+technically well-behaved: a conforming ERC-20 with standard fixed decimals (≤ 18), non-rebasing (a
+balance changes only on transfer), no transfer hooks or callbacks, freely transferable with no
+material fee-on-transfer, and honest, immutable metadata. Rebasing, fee-on-transfer, and hook-bearing
+tokens are excluded, since any would silently break the unit accounting. `setCollateral` enforces the
+mechanically-checkable part of this at listing time — a *sanity probe* that rejects a non-contract,
+an unresponsive `decimals()`/`balanceOf()`, or decimals above the immutable cap, so a malformed token
+fails at governance time rather than on first deposit. The behavioral properties (no rebase, no fee,
+no hooks) cannot be detected on-chain at a single point in time and remain a governance whitelist
+policy, backed by the timelock delay that gives holders a window to react to any listing.
+
 ---
 
 ## 4. Minting

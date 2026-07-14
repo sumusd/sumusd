@@ -108,6 +108,10 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         can never grow without limit. Drained, disabled collaterals can be removed to free a
     ///         slot ({removeCollateral}).
     uint256 internal constant MAX_COLLATERALS = 24;
+    /// @notice Immutable cap on a listed collateral's decimals. Every GENIUS-Act payment stablecoin uses
+    ///         6 or 18; values above 18 would strain the engine's `10 ** decimals` unit math, so they are
+    ///         rejected by the listing probe ({_probeCollateral}).
+    uint8 internal constant MAX_COLLATERAL_DECIMALS = 18;
     /// @notice Immutable sanity rail on the total `redeemFeeBps`. Caps the redemption fee governance
     ///         can impose (on top of the tilt haircut) at 2 bps (0.02%), so no admin can set a punitive
     ///         exit fee. 0 stays valid (no fee). The routable portion is separately capped at `redeemFeeBps`.
@@ -197,6 +201,8 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error CollateralCapReached(uint256 max);
     error CollateralStillEnabled(address token);
     error CollateralNotEmpty(address token);
+    error InvalidCollateralDecimals(uint8 decimals);
+    error CollateralProbeFailed(address token);
     error UseRedeemMix(uint256 ratioBps);
     error NotDistressed(uint256 ratioBps);
     error MinOutLengthMismatch();
@@ -586,7 +592,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         bool isNew = address(c.oracle) == address(0) && c.decimals == 0;
         if (isNew) {
             if (collateralList.length >= MAX_COLLATERALS) revert CollateralCapReached(MAX_COLLATERALS);
-            c.decimals = IERC20Metadata(collateral).decimals();
+            c.decimals = _probeCollateral(collateral); // conformance + decimals sanity, fail-fast on listing
             collateralList.push(collateral);
             emit CollateralListed(collateral, redeemRateBps, address(oracle));
         }
@@ -699,6 +705,28 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     // ---------------------------------------------------------------------
     // Internal math
     // ---------------------------------------------------------------------
+
+    /// @dev Sanity-probe a token being listed for the FIRST time and return its cached decimals. The
+    ///      token must be a conforming ERC-20 (its `decimals()` and `balanceOf()` must be callable) with
+    ///      decimals in [0, {MAX_COLLATERAL_DECIMALS}]. Reverts otherwise, so a non-conforming or
+    ///      oversized-decimals token fails at listing (governance time) rather than on first deposit.
+    ///      This CANNOT detect rebasing, fee-on-transfer, or transfer-hook tokens — those manifest over
+    ///      time or need a live transfer, so they remain a governance whitelist-policy matter (see the
+    ///      collateral eligibility policy).
+    function _probeCollateral(address collateral) internal view returns (uint8 dec) {
+        if (collateral.code.length == 0) revert CollateralProbeFailed(collateral); // must be a contract
+        try IERC20Metadata(collateral).decimals() returns (uint8 d) {
+            dec = d;
+        } catch {
+            revert CollateralProbeFailed(collateral);
+        }
+        if (dec > MAX_COLLATERAL_DECIMALS) revert InvalidCollateralDecimals(dec);
+        // The engine reads balanceOf everywhere; require it callable now as a basic conformance check.
+        try IERC20(collateral).balanceOf(address(this)) returns (uint256) {}
+        catch {
+            revert CollateralProbeFailed(collateral);
+        }
+    }
 
     /// @dev Revert if a collateral's price has drifted more than {MAX_DEPOSIT_PRICE_DEVIATION_BPS}
     ///      from $1.00 (WAD). Applied to deposits only.

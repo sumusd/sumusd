@@ -8,6 +8,7 @@ import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockOracle} from "./mocks/MockOracle.sol";
 import {BlacklistMockERC20} from "./mocks/BlacklistMockERC20.sol";
+import {RevertingBalanceMock} from "./mocks/RevertingBalanceMock.sol";
 
 contract SumUSDEngineTest is Test {
     uint256 internal constant WAD = 1e18;
@@ -672,6 +673,38 @@ contract SumUSDEngineTest is Test {
         vm.prank(owner);
         engine.setTiltSlopeBps(5000); // exactly the rail
         assertEq(engine.tiltSlopeBps(), 5000);
+    }
+
+    // --- setCollateral listing sanity probe (#8) ------------------------
+
+    function test_SetCollateral_RevertsDecimalsTooHigh() public {
+        MockERC20 big = new MockERC20("Big", "BIG", 24); // > MAX_COLLATERAL_DECIMALS (18)
+        vm.prank(owner);
+        vm.expectPartialRevert(SumUSDEngine.InvalidCollateralDecimals.selector);
+        engine.setCollateral(address(big), true, 9900, oracle);
+    }
+
+    function test_SetCollateral_AllowsDecimalsAtRail() public {
+        MockERC20 t18 = new MockERC20("Eighteen", "T18", 18); // exactly at the rail
+        vm.prank(owner);
+        engine.setCollateral(address(t18), true, 9900, oracle);
+        (, uint8 dec,,) = engine.configs(address(t18));
+        assertEq(dec, 18, "18-decimal token listed and cached");
+    }
+
+    function test_SetCollateral_RevertsOnNonConformingToken() public {
+        // Implements decimals() but reverts on balanceOf -> fails the conformance probe.
+        RevertingBalanceMock bad = new RevertingBalanceMock();
+        vm.prank(owner);
+        vm.expectPartialRevert(SumUSDEngine.CollateralProbeFailed.selector);
+        engine.setCollateral(address(bad), true, 9900, oracle);
+    }
+
+    function test_SetCollateral_RevertsOnNonToken() public {
+        // A plain address with no code can't answer decimals()/balanceOf() -> probe fails.
+        vm.prank(owner);
+        vm.expectPartialRevert(SumUSDEngine.CollateralProbeFailed.selector);
+        engine.setCollateral(makeAddr("notAToken"), true, 9900, oracle);
     }
 
     // --- collateral list cap & removal (fix #4) -------------------------

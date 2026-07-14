@@ -143,6 +143,13 @@ can't grow unbounded; `removeCollateral` de-lists a **disabled + zero-balance** 
 (swap-and-pop, config cleared) to free a slot. (To retire one still holding a balance: re-enable →
 let it be redeemed to zero → disable → remove.)
 
+**Listing sanity probe (`_probeCollateral`):** on FIRST listing, `setCollateral` requires the token
+be a conforming ERC-20 (has code; `decimals()` and `balanceOf()` callable) with `decimals <=
+MAX_COLLATERAL_DECIMALS` (18) — fail-fast at governance time (`InvalidCollateralDecimals` /
+`CollateralProbeFailed`). This catches non-tokens/oversized-decimals but **cannot** detect
+rebasing/fee-on-transfer/transfer-hook tokens (they need a live transfer or manifest over time); those
+stay a governance whitelist-policy matter (see the collateral eligibility FAQ on the website).
+
 **Oracle resilience:** `collateralValueUsd` prices a collateral via `_valuationPriceWad`: the live
 feed (`_tryPriceWad`, try/catch) if available; else, if the **stale-price fallback** is enabled, the
 last-good price minus `stalePriceHaircutBps` for up to `stalePriceGraceSeconds` after the last good
