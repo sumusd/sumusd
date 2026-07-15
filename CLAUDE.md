@@ -104,11 +104,11 @@ Consequences worth internalizing:
   another (subject to pool balance).
 - The **accumulated** surplus buffer is **locked permanently** — there is **no
   surplus-sweep path** to extract the buffer that has already built up. A small
-  **per-redemption fee** exists (2 bps, capped by immutable
-  `MAX_REDEEM_FEE_BPS`): `redeemFeeBps` is taken on single-flavor `redeem` on
-  top of the tilt haircut; `feeToRecipientBps` is routed to `feeRecipient`
+  **per-redemption margin** exists (2 bps, capped by immutable
+  `MAX_REDEEM_MARGIN_BPS`): `redeemMarginBps` is taken on single-flavor `redeem` on
+  top of the tilt haircut; `marginToRecipientBps` is routed to `marginRecipient`
   (best-effort transfer, skipped if it can't receive) and the rest is retained
-  as backing. `redeemMix` is exempt. Fee params + recipient are owner-only (96h
+  as backing. `redeemMix` is exempt. Margin params + recipient are owner-only (96h
   timelock). Do NOT widen this into a buffer-sweep path without an explicit
   request.
 - `systemCollateralizationRatioBps()` is the health metric: `10_000` = 100%. It
@@ -154,10 +154,10 @@ a guaranteed exit window. The safety-rail constants (`MAX_DEPOSIT_PRICE_DEVIATIO
 `MIN_MINT_RATIO_BPS`) are `immutable` with no setter at all. Even the *settable* params are
 sanity-railed: `setCollateral` rejects a `redeemRateBps` outside the immutable
 **[`MIN_REDEEM_RATE_BPS`, `MAX_REDEEM_RATE_BPS`] = [95%, 100%]** band, `setTiltSlopeBps` rejects
-anything above **`MAX_TILT_SLOPE_BPS` = 5000**, and `setRedeemFee` rejects a total above
-**`MAX_REDEEM_FEE_BPS` = 2** (or a routed portion exceeding the total) — so governance can tune the
-base rate, tilt, and fee but never set a punitive payout, an unredeemable slope, or an exit fee above
-2 bps. `setFeeRecipient` sets the fee's destination (all owner/timelock-gated).
+anything above **`MAX_TILT_SLOPE_BPS` = 5000**, and `setRedeemMargin` rejects a total above
+**`MAX_REDEEM_MARGIN_BPS` = 5** (or a routed portion exceeding the total) — so governance can tune the
+base rate, tilt, and margin but never set a punitive payout, an unredeemable slope, or an exit margin above
+2 bps. `setMarginRecipient` sets the margin's destination (all owner/timelock-gated).
 
 **Collateral-list cap:** the basket is capped at `MAX_COLLATERALS` (24) so the basket-wide loops
 can't grow unbounded; `removeCollateral` de-lists a **disabled + zero-balance** collateral

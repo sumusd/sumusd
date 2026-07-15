@@ -35,7 +35,7 @@ import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 ///          can carry a steeper base haircut.
 ///      Each redemption therefore leaves residual value in the pool, so the system trends
 ///      above 100% backing over time. That surplus is locked as permanent backing — there is
-///      no fee or sweep path to extract it.
+///      no margin or sweep path to extract it.
 ///
 ///      Weight-tilted haircut with a parity band (the basket's only balance mechanism). Each
 ///      flavor has an equal-weight target (1 / number of funded collaterals). A WIDE parity band is
@@ -112,10 +112,10 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         6 or 18; values above 18 would strain the engine's `10 ** decimals` unit math, so they are
     ///         rejected by the listing probe ({_probeCollateral}).
     uint8 internal constant MAX_COLLATERAL_DECIMALS = 18;
-    /// @notice Immutable sanity rail on the total `redeemFeeBps`. Caps the redemption fee governance
+    /// @notice Immutable sanity rail on the total `redeemMarginBps`. Caps the redemption margin governance
     ///         can impose (on top of the tilt haircut) at 2 bps (0.02%), so no admin can set a punitive
-    ///         exit fee. 0 stays valid (no fee). The routable portion is separately capped at `redeemFeeBps`.
-    uint256 internal constant MAX_REDEEM_FEE_BPS = 2; // 0.02%
+    ///         exit margin. 0 stays valid (no margin). The routable portion is separately capped at `redeemMarginBps`.
+    uint256 internal constant MAX_REDEEM_MARGIN_BPS = 5; // 0.05%
     /// @notice Immutable cap on the stale-price grace window (see {stalePriceGraceSeconds}), so
     ///         governance can never let a collateral be valued at a price older than this.
     uint256 internal constant MAX_STALE_PRICE_GRACE = 1 days;
@@ -145,17 +145,17 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         A fast, narrow safety brake — it can only stop exposure, never move value or re-enable.
     address public guardian;
 
-    /// @notice Total redemption fee (bps of the gross payout) taken on single-flavor {redeem}, ON TOP
-    ///         of the weight-tilt haircut. 0 disables the fee. Railed to `MAX_REDEEM_FEE_BPS`. The
-    ///         distress exit {redeemMix} is intentionally exempt (it stays fee/haircut/oracle-free).
-    uint16 public redeemFeeBps;
-    /// @notice Portion of `redeemFeeBps` routed to {feeRecipient}; the remainder stays in the pool as
-    ///         extra backing (an additional haircut). Must be <= `redeemFeeBps`. With the reference
+    /// @notice Total redemption margin (bps of the gross payout) taken on single-flavor {redeem}, ON TOP
+    ///         of the weight-tilt haircut. 0 disables the margin. Railed to `MAX_REDEEM_MARGIN_BPS`. The
+    ///         distress exit {redeemMix} is intentionally exempt (it stays margin/haircut/oracle-free).
+    uint16 public redeemMarginBps;
+    /// @notice Portion of `redeemMarginBps` routed to {marginRecipient}; the remainder stays in the pool as
+    ///         extra backing (an additional haircut). Must be <= `redeemMarginBps`. With the reference
     ///         2 bps / 1 bp config: 1 bp is paid to the recipient and 1 bp is retained as backing.
-    uint16 public feeToRecipientBps;
-    /// @notice Recipient of the routed fee portion. Settable only by the owner (the 96h timelock). While
+    uint16 public marginToRecipientBps;
+    /// @notice Recipient of the routed margin portion. Settable only by the owner (the 96h timelock). While
     ///         unset (`address(0)`), the routed portion also stays in the pool, so no value leaves.
-    address public feeRecipient;
+    address public marginRecipient;
 
     /// @notice Stale-price fallback (anti-distress-on-outage). When a collateral's LIVE feed is
     ///         unavailable, it is valued for the BACKING/tilt math at its last-good price minus
@@ -184,9 +184,11 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     event CollateralFrozen(address indexed token, address indexed by);
     event CollateralRemoved(address indexed token);
     event CollateralBackingExcludedSet(address indexed token, bool excluded);
-    event RedeemFeeUpdated(uint16 redeemFeeBps, uint16 feeToRecipientBps);
-    event FeeRecipientUpdated(address indexed feeRecipient);
-    event RedeemFeePaid(address indexed collateral, address indexed recipient, uint256 toRecipient, uint256 retained);
+    event RedeemMarginUpdated(uint16 redeemMarginBps, uint16 marginToRecipientBps);
+    event MarginRecipientUpdated(address indexed marginRecipient);
+    event RedeemMarginPaid(
+        address indexed collateral, address indexed recipient, uint256 toRecipient, uint256 retained
+    );
     event StalePriceParamsUpdated(uint32 graceSeconds, uint16 haircutBps);
     event PriceRecorded(address indexed token, uint256 priceWad, uint256 at);
 
@@ -210,7 +212,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error MinOutLengthMismatch();
     error BatchLengthMismatch();
     error ZeroCollateralOut(uint256 sumUsdAmount);
-    error InvalidRedeemFee(uint16 redeemFeeBps, uint16 feeToRecipientBps);
+    error InvalidRedeemMargin(uint16 redeemMarginBps, uint16 marginToRecipientBps);
     error InvalidStalePriceParams(uint32 graceSeconds, uint16 haircutBps);
 
     /// @param admin   Owner of the engine (risk admin / governance).
@@ -324,7 +326,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
 
     /// @dev One redemption leg, shared by {redeem} and {redeemBatch}. Prices `sumUsdAmount` of `collateral`
     ///      at its live weight-tilt rate over the given basket snapshot (`totalUsd`, `funded`), applies the
-    ///      fee, burns, sends the net to `msg.sender`, and settles the fee. The caller performs the distress
+    ///      margin, burns, sends the net to `msg.sender`, and settles the margin. The caller performs the distress
     ///      gate once (this does not). Reverts on an unlisted collateral, zero amount, dust, slippage, or
     ///      insufficient pool.
     function _redeemOne(
@@ -353,10 +355,10 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         // Fungible 1:1 payout: burning N SumUSD returns N * effectiveRate units of collateral,
         // decimal-normalized at par ($1 = 1 unit). The oracle price does not enter the conversion.
         uint256 grossOut = _toUnits((sumUsdAmount * effectiveRedeemRateBps) / BPS, c);
-        // Redemption fee (bps of the gross payout) on top of the tilt haircut, deducted from the
-        // redeemer; the routed portion goes to `feeRecipient` and the rest stays pooled as extra
-        // backing. {redeemMix} (the distress exit) is exempt. Settled after the burn by {_settleRedeemFee}.
-        collateralOut = grossOut - (grossOut * redeemFeeBps) / BPS; // net to the redeemer
+        // Redemption margin (bps of the gross payout) on top of the tilt haircut, deducted from the
+        // redeemer; the routed portion goes to `marginRecipient` and the rest stays pooled as extra
+        // backing. {redeemMix} (the distress exit) is exempt. Settled after the burn by {_settleRedeemMargin}.
+        collateralOut = grossOut - (grossOut * redeemMarginBps) / BPS; // net to the redeemer
 
         // Dust guard: if a POSITIVE-rate redemption nets to zero collateral (input too small for the
         // token's decimals), revert rather than burn SumUSD for nothing. A rate of exactly 0 (a
@@ -365,13 +367,13 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         // another flavor (SumUSD is a fungible claim), or {redeemMix} in distress.
         if (collateralOut == 0 && effectiveRedeemRateBps != 0) revert ZeroCollateralOut(sumUsdAmount);
         if (collateralOut < minCollateralOut) revert SlippageExceeded(collateralOut, minCollateralOut);
-        // The full gross must be available (net to redeemer + routed fee both come out of it; any
-        // retained fee just stays pooled), so checking gross conservatively covers both transfers.
+        // The full gross must be available (net to redeemer + routed margin both come out of it; any
+        // retained margin just stays pooled), so checking gross conservatively covers both transfers.
         if (grossOut > available) revert InsufficientPool(collateral, grossOut, available);
 
         sumUsd.burn(msg.sender, sumUsdAmount);
         IERC20(collateral).safeTransfer(msg.sender, collateralOut);
-        _settleRedeemFee(collateral, grossOut); // routes the fee portion (best-effort) and emits
+        _settleRedeemMargin(collateral, grossOut); // routes the margin portion (best-effort) and emits
         emit Redeemed(msg.sender, collateral, sumUsdAmount, collateralOut);
     }
 
@@ -562,7 +564,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Quote the NET collateral `redeeming` `sumUsdAmount` of `collateral` would return right
-    ///         now — the weight-tilted haircut AND the redemption fee both applied — so the quote
+    ///         now — the weight-tilted haircut AND the redemption margin both applied — so the quote
     ///         matches the actual {redeem} payout.
     function previewRedeem(address collateral, uint256 sumUsdAmount) external view returns (uint256) {
         (uint256 totalUsd, uint256 funded) = _basketStats();
@@ -590,7 +592,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev Net collateral a redemption of `sumUsdAmount` in `collateral` returns over the given basket
-    ///      snapshot — the weight-tilt haircut AND the fee applied. Shared by the redeem previews so a
+    ///      snapshot — the weight-tilt haircut AND the margin applied. Shared by the redeem previews so a
     ///      quote can never diverge from the {redeem}/{redeemBatch} payout.
     function _quoteRedeem(address collateral, uint256 sumUsdAmount, uint256 totalUsd, uint256 funded)
         internal
@@ -601,13 +603,13 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         uint256 poolBalance = IERC20(collateral).balanceOf(address(this));
         uint256 effectiveRedeemRateBps = _liveRedeemRateBps(collateral, c, poolBalance, totalUsd, funded);
         uint256 grossOut = _toUnits((sumUsdAmount * effectiveRedeemRateBps) / BPS, c);
-        (uint256 feeTotal,) = _redeemFee(grossOut);
-        return grossOut - feeTotal;
+        (uint256 marginTotal,) = _redeemMargin(grossOut);
+        return grossOut - marginTotal;
     }
 
     /// @notice Break down what redeeming `sumUsdAmount` of `collateral` pays right now: the redeemer's
-    ///         net, the fee routed to {feeRecipient}, and the fee retained in the pool.
-    function previewRedeemFee(address collateral, uint256 sumUsdAmount)
+    ///         net, the margin routed to {marginRecipient}, and the margin retained in the pool.
+    function previewRedeemMargin(address collateral, uint256 sumUsdAmount)
         external
         view
         returns (uint256 toRedeemer, uint256 toRecipient, uint256 retained)
@@ -617,16 +619,16 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         uint256 poolBalance = IERC20(collateral).balanceOf(address(this));
         uint256 effectiveRedeemRateBps = _liveRedeemRateBps(collateral, c, poolBalance, totalUsd, funded);
         uint256 grossOut = _toUnits((sumUsdAmount * effectiveRedeemRateBps) / BPS, c);
-        uint256 feeTotal;
-        (feeTotal, toRecipient) = _redeemFee(grossOut);
-        toRedeemer = grossOut - feeTotal;
-        retained = feeTotal - toRecipient;
+        uint256 marginTotal;
+        (marginTotal, toRecipient) = _redeemMargin(grossOut);
+        toRedeemer = grossOut - marginTotal;
+        retained = marginTotal - toRecipient;
     }
 
     /// @notice The effective redemption rate (bps) for `collateral` right now: its base `redeemRateBps`
     ///         tilted by the basket's current imbalance. `10_000` == 100% (no haircut). This is the
-    ///         weight-tilt rate ONLY — it does NOT include the flat `redeemFeeBps` redemption fee; use
-    ///         {previewRedeem}/{previewRedeemFee} for the exact net payout.
+    ///         weight-tilt rate ONLY — it does NOT include the flat `redeemMarginBps` redemption margin; use
+    ///         {previewRedeem}/{previewRedeemMargin} for the exact net payout.
     function currentRedeemRateBps(address collateral) public view returns (uint256) {
         CollateralConfig memory c = configs[collateral];
         (uint256 totalUsd, uint256 funded) = _basketStats();
@@ -770,28 +772,28 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit TiltSlopeUpdated(newTiltSlopeBps);
     }
 
-    /// @notice Set the single-flavor redemption fee (bps of the gross payout, on top of the tilt
-    ///         haircut) and the portion of it routed to {feeRecipient}; the remainder stays in the pool
+    /// @notice Set the single-flavor redemption margin (bps of the gross payout, on top of the tilt
+    ///         haircut) and the portion of it routed to {marginRecipient}; the remainder stays in the pool
     ///         as extra backing. Owner-only, so in production every change waits the 96h timelock.
-    /// @dev {redeemMix} (the distress exit) is never charged. Reference config: `newRedeemFeeBps = 2`
-    ///      (2 bps total), `newFeeToRecipientBps = 1` (1 bp to the recipient, 1 bp retained as backing).
-    /// @param newRedeemFeeBps      Total fee, railed to [0, {MAX_REDEEM_FEE_BPS}].
-    /// @param newFeeToRecipientBps Portion routed to {feeRecipient}; must be <= `newRedeemFeeBps`.
-    function setRedeemFee(uint16 newRedeemFeeBps, uint16 newFeeToRecipientBps) external onlyOwner {
-        if (newRedeemFeeBps > MAX_REDEEM_FEE_BPS || newFeeToRecipientBps > newRedeemFeeBps) {
-            revert InvalidRedeemFee(newRedeemFeeBps, newFeeToRecipientBps);
+    /// @dev {redeemMix} (the distress exit) is never charged. Reference config: `newRedeemMarginBps = 2`
+    ///      (2 bps total), `newMarginToRecipientBps = 1` (1 bp to the recipient, 1 bp retained as backing).
+    /// @param newRedeemMarginBps      Total margin, railed to [0, {MAX_REDEEM_MARGIN_BPS}].
+    /// @param newMarginToRecipientBps Portion routed to {marginRecipient}; must be <= `newRedeemMarginBps`.
+    function setRedeemMargin(uint16 newRedeemMarginBps, uint16 newMarginToRecipientBps) external onlyOwner {
+        if (newRedeemMarginBps > MAX_REDEEM_MARGIN_BPS || newMarginToRecipientBps > newRedeemMarginBps) {
+            revert InvalidRedeemMargin(newRedeemMarginBps, newMarginToRecipientBps);
         }
-        redeemFeeBps = newRedeemFeeBps;
-        feeToRecipientBps = newFeeToRecipientBps;
-        emit RedeemFeeUpdated(newRedeemFeeBps, newFeeToRecipientBps);
+        redeemMarginBps = newRedeemMarginBps;
+        marginToRecipientBps = newMarginToRecipientBps;
+        emit RedeemMarginUpdated(newRedeemMarginBps, newMarginToRecipientBps);
     }
 
-    /// @notice Set (or clear, with `address(0)`) the recipient of the routed redemption-fee portion.
+    /// @notice Set (or clear, with `address(0)`) the recipient of the routed redemption-margin portion.
     ///         Owner-only, so changing it waits the 96h timelock. While unset, the routed portion stays
-    ///         in the pool (no value leaves), so a fee can be configured before a treasury is live.
-    function setFeeRecipient(address newRecipient) external onlyOwner {
-        feeRecipient = newRecipient;
-        emit FeeRecipientUpdated(newRecipient);
+    ///         in the pool (no value leaves), so a margin can be configured before a treasury is live.
+    function setMarginRecipient(address newRecipient) external onlyOwner {
+        marginRecipient = newRecipient;
+        emit MarginRecipientUpdated(newRecipient);
     }
 
     /// @notice Configure the stale-price fallback: `graceSeconds` is how long a collateral whose live
@@ -855,24 +857,24 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         return (amount18 * (10 ** c.decimals)) / WAD;
     }
 
-    /// @dev Split a gross redemption payout into the total fee and the portion routed to `feeRecipient`
+    /// @dev Split a gross redemption payout into the total margin and the portion routed to `marginRecipient`
     ///      (0 while the recipient is unset — the routed portion then stays pooled). The remaining
-    ///      `feeTotal - toRecipient` always stays in the pool as extra backing. Both round down.
-    function _redeemFee(uint256 grossOut) internal view returns (uint256 feeTotal, uint256 toRecipient) {
-        feeTotal = (grossOut * redeemFeeBps) / BPS;
-        if (feeRecipient != address(0)) toRecipient = (grossOut * feeToRecipientBps) / BPS;
+    ///      `marginTotal - toRecipient` always stays in the pool as extra backing. Both round down.
+    function _redeemMargin(uint256 grossOut) internal view returns (uint256 marginTotal, uint256 toRecipient) {
+        marginTotal = (grossOut * redeemMarginBps) / BPS;
+        if (marginRecipient != address(0)) toRecipient = (grossOut * marginToRecipientBps) / BPS;
     }
 
-    /// @dev Route the redemption fee for a gross payout of `grossOut` in `collateral`, after the
+    /// @dev Route the redemption margin for a gross payout of `grossOut` in `collateral`, after the
     ///      redeemer's net has already been sent. The recipient portion is transferred best-effort (a
-    ///      recipient that can't receive is skipped, its slice staying pooled) so the fee can never
-    ///      block a redemption; the retained portion is left in the pool. Emits {RedeemFeePaid} when a
-    ///      fee applies. Kept as a separate call so {redeem} stays under the stack-depth limit.
-    function _settleRedeemFee(address collateral, uint256 grossOut) internal {
-        (uint256 feeTotal, uint256 toRecipient) = _redeemFee(grossOut);
-        if (feeTotal == 0) return;
-        if (toRecipient != 0 && !_tryTransfer(collateral, feeRecipient, toRecipient)) toRecipient = 0;
-        emit RedeemFeePaid(collateral, feeRecipient, toRecipient, feeTotal - toRecipient);
+    ///      recipient that can't receive is skipped, its slice staying pooled) so the margin can never
+    ///      block a redemption; the retained portion is left in the pool. Emits {RedeemMarginPaid} when a
+    ///      margin applies. Kept as a separate call so {redeem} stays under the stack-depth limit.
+    function _settleRedeemMargin(address collateral, uint256 grossOut) internal {
+        (uint256 marginTotal, uint256 toRecipient) = _redeemMargin(grossOut);
+        if (marginTotal == 0) return;
+        if (toRecipient != 0 && !_tryTransfer(collateral, marginRecipient, toRecipient)) toRecipient = 0;
+        emit RedeemMarginPaid(collateral, marginRecipient, toRecipient, marginTotal - toRecipient);
     }
 
     /// @dev Resilient oracle read. Returns (price, true) on a successful, non-zero quote; (0, false)

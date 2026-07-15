@@ -49,10 +49,10 @@ contract SetupLocal is Script {
         engine.setCollateral(address(flavorC), true, BASE_C, oracle);
         engine.setTiltSlopeBps(TILT);
 
-        // 2 bps redemption fee: 1 bp retained as extra backing, 1 bp routed to the fee recipient
+        // 2 bps redemption margin: 1 bp retained as extra backing, 1 bp routed to the margin recipient
         // (the deployer here, stands in for a treasury). redeemMix (distress exit) is exempt.
-        engine.setRedeemFee(2, 1);
-        engine.setFeeRecipient(admin);
+        engine.setRedeemMargin(2, 1);
+        engine.setMarginRecipient(admin);
 
         // Mint plenty to the deployer, then seed an imbalanced basket via real deposits.
         flavorA.mint(admin, 2_000_000e6);

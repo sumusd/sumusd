@@ -23,7 +23,7 @@ contract RedeemBatchTest is Test {
     MockERC20 internal c; // 18 decimals, base 97%
 
     address internal alice = makeAddr("alice");
-    address internal recipient = makeAddr("feeRecipient");
+    address internal recipient = makeAddr("marginRecipient");
 
     function setUp() public {
         sumUsd = new SumUSD(address(this));
@@ -86,7 +86,7 @@ contract RedeemBatchTest is Test {
         assertEq(outs.length, 2, "one output per leg");
         assertEq(outs[0], preview[0], "leg A payout matches its preview");
         assertEq(outs[1], preview[1], "leg B payout matches its preview");
-        // Base 99% at par, 6-decimal flavors, fee off: 100 SumUSD -> 99 units.
+        // Base 99% at par, 6-decimal flavors, margin off: 100 SumUSD -> 99 units.
         assertEq(outs[0], 99e6, "leg A: 99% of 100 face");
         assertEq(outs[1], 99e6, "leg B: 99% of 100 face");
     }
@@ -131,8 +131,8 @@ contract RedeemBatchTest is Test {
 
     function test_Batch_AppliesFeePerLeg() public {
         _seedBalanced();
-        engine.setRedeemFee(2, 1); // 2 bps total, 1 bp routed
-        engine.setFeeRecipient(recipient);
+        engine.setRedeemMargin(2, 1); // 2 bps total, 1 bp routed
+        engine.setMarginRecipient(recipient);
 
         address[] memory cols = _addr2(address(a), address(b));
         uint256[] memory amts = _u2(1_000e18, 1_000e18);
@@ -141,11 +141,11 @@ contract RedeemBatchTest is Test {
         vm.prank(alice);
         uint256[] memory outs = engine.redeemBatch(cols, amts, _u2(0, 0));
 
-        // gross 990e6 per leg (99% base); minus 2 bps fee = 990e6 - 0.198e6 = 989.802e6.
+        // gross 990e6 per leg (99% base); minus 2 bps margin = 990e6 - 0.198e6 = 989.802e6.
         assertEq(outs[0], 989_802000, "leg A nets gross minus 2 bps");
         assertEq(outs[1], 989_802000, "leg B nets gross minus 2 bps");
-        assertEq(outs[0], preview[0], "fee-inclusive preview matches leg A payout");
-        assertEq(outs[1], preview[1], "fee-inclusive preview matches leg B payout");
+        assertEq(outs[0], preview[0], "margin-inclusive preview matches leg A payout");
+        assertEq(outs[1], preview[1], "margin-inclusive preview matches leg B payout");
         assertEq(a.balanceOf(recipient), 99000, "leg A routed 1 bp of the 990 gross");
         assertEq(b.balanceOf(recipient), 99000, "leg B routed 1 bp of the 990 gross");
     }

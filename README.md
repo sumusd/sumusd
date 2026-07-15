@@ -6,7 +6,7 @@ SumUSD is a pooled peg-stability module over a governance-curated basket of cred
 GENIUS-Act-compliant USD stablecoins ("flavors"). Deposit any whitelisted flavor and mint a single
 fungible dollar token, **SumUSD**, at a raw 1:1 unit rate; burn SumUSD to redeem any flavor the pool
 currently holds. The protocol becomes and stays over-collateralized through a redemption haircut
-rather than a deposit-side margin requirement.
+rather than a deposit-side collateral requirement.
 
 This repository holds the protocol — the Solidity contracts and the specification. The mint/redeem
 web app lives in a separate repo: **[sumusd/website](https://github.com/sumusd/website)**.
@@ -26,8 +26,8 @@ web app lives in a separate repo: **[sumusd/website](https://github.com/sumusd/w
 - **Minimal, slow governance.** There is no global pause. Parameters are owned by an
   `ImmutableTimelock` (96h delay), leaving holders a guaranteed exit window; the one fast lever is a
   `guardian` that can freeze a single misbehaving collateral. The core safety rails (peg band, mint
-  floor, redeem-rate / tilt / fee caps) are immutable with no setter.
-- **Small redemption fee.** 2 bps on single-flavor redemption (immutably capped, timelock-set): 1 bp
+  floor, redeem-rate / tilt / margin caps) are immutable with no setter.
+- **Small redemption margin.** 2 bps on single-flavor redemption (immutably capped, timelock-set): 1 bp
   is retained as backing and 1 bp is routed to a governance-set recipient. The distress exit is exempt.
 
 See **[WHITEPAPER.md](./WHITEPAPER.md)** for the full design and rationale, and **[CLAUDE.md](./CLAUDE.md)**
@@ -64,7 +64,7 @@ forge script script/Deploy.s.sol:Deploy \
   --rpc-url $RPC_URL --private-key $PRIVATE_KEY --broadcast
 ```
 
-Collateral listing, oracle wiring, and the tilt/fee parameters are deliberate follow-up governance
+Collateral listing, oracle wiring, and the tilt/margin parameters are deliberate follow-up governance
 actions (not hardcoded in the core deploy). `script/SetupSepolia.s.sol` and `script/SetupLocal.s.sol`
 bring up the full stack against a testnet or a local `anvil` for development.
 

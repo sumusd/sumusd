@@ -3,8 +3,8 @@ pragma solidity 0.8.34;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-/// @notice Mintable ERC-20 that blocks transfers to one configurable address, simulating a fee
-///         recipient (treasury) an issuer has blacklisted. Used to prove the redemption fee routing is
+/// @notice Mintable ERC-20 that blocks transfers to one configurable address, simulating a margin
+///         recipient (treasury) an issuer has blacklisted. Used to prove the redemption margin routing is
 ///         best-effort: a recipient that can't receive is skipped, never blocking the redemption.
 contract RecipientBlockMockERC20 is ERC20 {
     uint8 private immutable _decimals;

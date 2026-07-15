@@ -168,8 +168,8 @@ DATA=$(cast calldata "setSources(address,address[],uint32,uint32)" \
 | Action | Inner call | Rail |
 |---|---|---|
 | Set the tilt slope | `setTiltSlopeBps(uint16)` — `(slope)` | `<= 5000` |
-| Set the redemption fee + split | `setRedeemFee(uint16,uint16)` — `(totalBps, toRecipientBps)` | total `<= 2`, routed `<= total` |
-| Set the fee recipient | `setFeeRecipient(address)` — `(recipient)` | `address(0)` = keep the routed part pooled |
+| Set the redemption margin + split | `setRedeemMargin(uint16,uint16)` — `(totalBps, toRecipientBps)` | total `<= 5`, routed `<= total` |
+| Set the margin recipient | `setMarginRecipient(address)` — `(recipient)` | `address(0)` = keep the routed part pooled |
 | Set the stale-price fallback | `setStalePriceParams(uint32,uint16)` — `(graceSeconds, haircutBps)` | grace `<= 1 day`, haircut `<= 10000`; grace `0` disables |
 
 ### Guardian & token roles (target `$ENGINE` / `$TOKEN`)

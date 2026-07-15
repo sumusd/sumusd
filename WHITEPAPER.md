@@ -10,7 +10,7 @@ SumUSD is an ERC-20 stablecoin that aggregates a governance-whitelisted basket o
 major USD stablecoins — prioritizing GENIUS Act–compliant, U.S. Treasury-backed issuers — into
 a single, fungible unit of dollar value. Users deposit any whitelisted collateral and receive SumUSD at a raw 1:1 unit rate;
 they burn SumUSD to redeem any flavor the protocol holds. The protocol becomes and stays over-collateralized
-through a *redemption haircut* rather than a deposit-side margin requirement, and it keeps its
+through a *redemption haircut* rather than a deposit-side collateral requirement, and it keeps its
 collateral basket diversified through a single, continuous price signal: a **convex
 weight-tilted haircut** (inspired by surge/congestion pricing) that prices redemptions of an
 over-represented flavor cheaply and makes draining a scarce flavor progressively — and steeply —
@@ -71,7 +71,7 @@ SumUSD supply, trending above it over time.
 | Under-collateralization mint guard | Pause issuance into an under-backed pool | Deposit |
 | Base redemption haircut | Create the over-collateralization buffer | Redeem |
 | Convex weight-tilted haircut | Incentivize rebalancing; make depleting a scarce flavor self-defeating | Redeem |
-| Redemption fee (2 bps, capped) | 1 bp extra backing + 1 bp to a governance-set recipient | Redeem |
+| Redemption margin (2 bps, capped) | 1 bp extra backing + 1 bp to a governance-set recipient | Redeem |
 | `poolNeeds()` deposit nudge | Steer fresh deposits toward under-represented flavors | Deposit (UI) |
 | `donate()` recapitalization | Add backing with no mint; lift the ratio back above the floor | Anyone |
 | Guardian collateral freeze | Instantly quarantine one misbehaving collateral (no value control) | Admin (guardian) |
@@ -187,7 +187,7 @@ material fee-on-transfer, and honest, immutable metadata. Rebasing, fee-on-trans
 tokens are excluded, since any would silently break the unit accounting. `setCollateral` enforces the
 mechanically-checkable part of this at listing time — a *sanity probe* that rejects a non-contract,
 an unresponsive `decimals()`/`balanceOf()`, or decimals above the immutable cap, so a malformed token
-fails at governance time rather than on first deposit. The behavioral properties (no rebase, no fee,
+fails at governance time rather than on first deposit. The behavioral properties (no rebase, no margin,
 no hooks) cannot be detected on-chain at a single point in time and remain a governance whitelist
 policy, backed by the timelock delay that gives holders a window to react to any listing.
 
@@ -376,26 +376,26 @@ the whole pro-rata exit; its slice simply stays pooled. Above 99% backing, `rede
 (`NotDistressed`) and normal pick-your-flavor redemption with the tilt applies; `previewRedeemMix`
 and `listedCollaterals` support the UI.
 
-### 5.5 Redemption fee
+### 5.5 Redemption margin
 
-On top of the weight-tilt haircut, single-flavor redemption carries a small **protocol fee**,
-`redeemFeeBps` (bps of the gross payout), split into a portion routed to a governance-set
-`feeRecipient` (`feeToRecipientBps`) and a remainder retained in the pool as extra backing. The
+On top of the weight-tilt haircut, single-flavor redemption carries a small **protocol margin**,
+`redeemMarginBps` (bps of the gross payout), split into a portion routed to a governance-set
+`marginRecipient` (`marginToRecipientBps`) and a remainder retained in the pool as extra backing. The
 reference configuration is **2 bps total, split 1 bp / 1 bp**: 1 bp is paid to the recipient and 1 bp
-joins the over-collateralization buffer. The fee is immutably capped at `MAX_REDEEM_FEE_BPS` (2 bps),
-so governance can tune or disable it but never set a punitive exit fee. Both `redeemFeeBps`/
-`feeToRecipientBps` and the recipient address are set only by the owner, i.e. behind the 96h timelock.
+joins the over-collateralization buffer. The margin is immutably capped at `MAX_REDEEM_MARGIN_BPS` (5 bps),
+so governance can tune or disable it but never set a punitive exit margin. Both `redeemMarginBps`/
+`marginToRecipientBps` and the recipient address are set only by the owner, i.e. behind the 96h timelock.
 
 Three properties keep it safe:
 
-- **Distress-exempt.** The fee applies only to normal single-flavor `redeem`. `redeemMix` — the
+- **Distress-exempt.** The margin applies only to normal single-flavor `redeem`. `redeemMix` — the
   pro-rata distress exit — is never charged, preserving its run-proof, oracle-free fairness (§5.4).
 - **Never blocks a redemption.** The routed portion is transferred to the recipient *best-effort*: if
   the recipient cannot receive the token (e.g. a blacklisted treasury), that slice is skipped and
-  stays pooled rather than reverting the redemption. Redemptions are never gated by the fee.
-- **Quoted exactly.** `previewRedeem` returns the net-of-fee payout and `previewRedeemFee` breaks a
+  stays pooled rather than reverting the redemption. Redemptions are never gated by the margin.
+- **Quoted exactly.** `previewRedeem` returns the net-of-margin payout and `previewRedeemMargin` breaks a
   redemption into redeemer / recipient / retained, so quotes never diverge from what `redeem` pays.
-  (`currentRedeemRateBps` still reports the tilt rate only — the fee is a separate flat bps.)
+  (`currentRedeemRateBps` still reports the tilt rate only — the margin is a separate flat bps.)
 
 ### 5.6 Batch redemption (`redeemBatch`)
 
@@ -420,7 +420,7 @@ for cutting N approvals/transactions to one. It changes no economics:
   (`minOuts[i]`), insufficient pool, or a length mismatch across the three arrays — reverts the entire
   call, so a batch either settles completely or not at all.
 
-The fee (§5.5) applies per leg exactly as in single `redeem`. `redeemBatch` must be a native engine
+The margin (§5.5) applies per leg exactly as in single `redeem`. `redeemBatch` must be a native engine
 function rather than an external router, because `SumUSD` burns are `MINTER_ROLE`-gated and burn the
 caller with no allowance path — no third-party contract can batch redemptions on a holder's behalf.
 
@@ -435,9 +435,9 @@ way *out*: every redemption returns less than the burned face value (the haircut
 residual collateral in the pool. Over time this drives mark-to-market backing above 100%. The
 **accumulated surplus is locked as permanent backing** — there is no path to sweep the buffer that
 has already built up, so it only grows. The one value that *does* leave is a small, immutably-capped
-per-redemption protocol fee (§5.5): of the 2 bps taken on each single-flavor redemption, 1 bp is
-retained (adding to this same buffer) and 1 bp is routed to a governance-set recipient. The fee is
-bounded to `MAX_REDEEM_FEE_BPS` (2 bps) and never touches the existing buffer.
+per-redemption protocol margin (§5.5): of the 2 bps taken on each single-flavor redemption, 1 bp is
+retained (adding to this same buffer) and 1 bp is routed to a governance-set recipient. The margin is
+bounded to `MAX_REDEEM_MARGIN_BPS` (5 bps) and never touches the existing buffer.
 
 The buffer can also be topped up directly. Anyone may call **`donate(collateral, amount)`** to add a
 listed collateral to the pool as permanent backing, minting **no** SumUSD in return — it raises
@@ -598,7 +598,7 @@ dollar.
 | `MIN_REDEEM_RATE_BPS` / `MAX_REDEEM_RATE_BPS` | `9_500` / `10_000` (95% / 100%) | Sanity rails on a collateral's base redeem rate — governance can only set it inside this band |
 | `MAX_TILT_SLOPE_BPS` | `5_000` | Sanity rail on `tiltSlopeBps` — caps how steep the tilt can be set |
 | `MAX_COLLATERALS` | `24` | Cap on listed collaterals — bounds the gas of all basket-wide loops |
-| `MAX_REDEEM_FEE_BPS` | `2` (0.02%) | Sanity rail on the redemption fee — caps the total exit fee governance can impose |
+| `MAX_REDEEM_MARGIN_BPS` | `5` (0.05%) | Sanity rail on the redemption margin — caps the total exit margin governance can impose |
 | `DISTRESS_RATIO_BPS` | `9_900` (99%) | Below this, single-flavor redeem is disabled in favor of pro-rata `redeemMix` |
 
 ### 8.2 Governance parameters (set via the engine's owner)
@@ -607,9 +607,9 @@ dollar.
 |---|---|---|---|
 | `redeemRateBps` | per collateral | 99% (most flavors), 97% (conservatively rated) | Base redemption rate. Immutably bounded to **[95%, 100%]** (`MIN_/MAX_REDEEM_RATE_BPS`) |
 | `tiltSlopeBps` | global | 500 | Sensitivity of the convex haircut to imbalance (0 = flat). Railed to ≤ `MAX_TILT_SLOPE_BPS` (5000) |
-| `redeemFeeBps` | global | 2 | Total redemption fee (bps of gross payout), on top of the tilt haircut. Railed to ≤ `MAX_REDEEM_FEE_BPS` (2) |
-| `feeToRecipientBps` | global | 1 | Portion of `redeemFeeBps` routed to `feeRecipient`; rest retained as backing. Must be ≤ `redeemFeeBps` |
-| `feeRecipient` | global | deployment-specific | Recipient of the routed fee. `address(0)` ⇒ the routed portion stays pooled |
+| `redeemMarginBps` | global | 2 | Total redemption margin (bps of gross payout), on top of the tilt haircut. Railed to ≤ `MAX_REDEEM_MARGIN_BPS` (5) |
+| `marginToRecipientBps` | global | 1 | Portion of `redeemMarginBps` routed to `marginRecipient`; rest retained as backing. Must be ≤ `redeemMarginBps` |
+| `marginRecipient` | global | deployment-specific | Recipient of the routed margin. `address(0)` ⇒ the routed portion stays pooled |
 | `enabled` | per collateral | true | Accept deposits/redemptions |
 | `oracle` | per collateral | deployment-specific | USD price feed |
 
@@ -632,8 +632,8 @@ The engine's owner can:
   balance, so removal can never strand funds or change backing; this frees a slot against the
   `MAX_COLLATERALS` cap;
 - tune the imbalance sensitivity (`setTiltSlopeBps`);
-- set the redemption fee and its split (`setRedeemFee`, railed to `MAX_REDEEM_FEE_BPS`) and the fee
-  recipient (`setFeeRecipient`);
+- set the redemption margin and its split (`setRedeemMargin`, railed to `MAX_REDEEM_MARGIN_BPS`) and the margin
+  recipient (`setMarginRecipient`);
 - "silo" a permanently-inaccessible flavor (`setCollateralBackingExcluded`, below);
 - set the guardian (`setGuardian`).
 
@@ -687,8 +687,8 @@ strictly-immutable delay is required.)
 The peg band and the 99% mint guard are **constants**, not governance levers — they are core
 safety properties rather than tunable policy. Governance cannot mint SumUSD directly, cannot
 return more than face value on redemption, and cannot sweep the accumulated over-collateralization
-buffer. The one value it can route out is the per-redemption fee, and only within the immutable
-`MAX_REDEEM_FEE_BPS` (2 bps) cap — the accumulated buffer itself stays untouchable.
+buffer. The one value it can route out is the per-redemption margin, and only within the immutable
+`MAX_REDEEM_MARGIN_BPS` (5 bps) cap — the accumulated buffer itself stays untouchable.
 
 The trade-off of having no pause is that there is no circuit breaker to halt an in-progress
 exploit; the design leans instead on a minimal, immutable surface (constants for the rails,

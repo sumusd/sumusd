@@ -92,10 +92,10 @@ contract SetupSepolia is Script {
         // under-represented one gets steeply more expensive as it depletes — nudging rebalancing.
         engine.setTiltSlopeBps(TILT);
 
-        // 2 bps redemption fee: 1 bp retained as extra backing, 1 bp routed to the fee recipient
+        // 2 bps redemption margin: 1 bp retained as extra backing, 1 bp routed to the margin recipient
         // (the deployer here, stands in for a treasury). redeemMix (distress exit) is exempt.
-        engine.setRedeemFee(2, 1);
-        engine.setFeeRecipient(admin);
+        engine.setRedeemMargin(2, 1);
+        engine.setMarginRecipient(admin);
 
         // Stale-price fallback: if a feed goes down, value the flavor at its last-good price minus 1%
         // for up to 6 hours (for backing/tilt only), so a transient outage doesn't trip the whole
