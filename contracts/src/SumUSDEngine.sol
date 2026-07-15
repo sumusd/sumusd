@@ -1002,15 +1002,15 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         if (slope == 0 || funded < 2 || totalUsd == 0) return baseRedeemRateBps;
 
         uint256 shareBps = (collateralUsd * BPS) / totalUsd;
-        uint256 targetBps = BPS / funded;
 
-        // Parity band: a flavor redeems at its base rate while its weight sits between half and
-        // twice its equal-weight target. The overweight discount starts only ABOVE 2x target; the
-        // convex underweight premium starts only BELOW 1/2x target. Edges are inclusive, so a flavor
-        // must be strictly outside the band before any tilt is priced. Tilts are measured from the
-        // band edge (not from target), so the rate is continuous at the knee.
-        uint256 upperEdge = 2 * targetBps;
-        uint256 lowerEdge = targetBps / 2;
+        // Parity band around the equal-weight target (`BPS / funded`): a flavor redeems at its base
+        // rate while its weight sits between half and twice that target. The overweight discount starts
+        // only ABOVE 2x target; the convex underweight premium starts only BELOW 1/2x target. Edges are
+        // inclusive, so a flavor must be strictly outside the band before any tilt is priced. Tilts are
+        // measured from the band edge (not from target), so the rate is continuous at the knee. The
+        // edges multiply BPS before dividing (no divide-before-multiply), so each is exact to the floor.
+        uint256 upperEdge = (2 * BPS) / funded; // 2 x (BPS / funded)
+        uint256 lowerEdge = BPS / (2 * funded); // (BPS / funded) / 2
 
         if (shareBps > upperEdge) {
             // Over-represented beyond the band: small linear discount (smaller haircut), capped at 100%.
