@@ -68,11 +68,6 @@ Collateral listing, oracle wiring, and the tilt/margin parameters are deliberate
 actions (not hardcoded in the core deploy). `script/SetupSepolia.s.sol` and `script/SetupLocal.s.sol`
 bring up the full stack against a testnet or a local `anvil` for development.
 
-## Status
-
-Unaudited. Do not use in production without an independent security review. The collateral tokens
-and price feeds used in the setup scripts are mocks, for testnets only.
-
 ## License
 
 Business Source License 1.1 (BUSL-1.1) — see [LICENSE](./LICENSE). Non-commercial use is permitted;
