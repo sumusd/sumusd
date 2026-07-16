@@ -5,6 +5,12 @@ transactions to build for every privileged action, and end-to-end checklists for
 
 Read [WHITEPAPER.md](./WHITEPAPER.md) §9 for the design rationale; this document is the how-to.
 
+> **Tooling.** [`governance/`](./governance) scripts every step below through the Safe{Core} SDK and the
+> Safe Transaction Service **API** — deploy the Safes, and propose / confirm / execute each operation
+> from the command line, no web UI. It encodes the exact calldata this document specifies. The manual
+> `cast` + Safe-app flow here remains valid as a fallback and as the reference for what the tool builds.
+> Example: `npm run gov -- queue set-tilt 500 --salt set-tilt-500` (see `governance/README.md`).
+
 ---
 
 ## 1. Topology: who owns what
@@ -45,9 +51,10 @@ export GOV_SAFE=0x...                      # governance Safe (the timelock execu
 export GUARDIAN_SAFE=0x...                 # guardian Safe
 ```
 
-`cast` is from [Foundry](https://book.getfoundry.sh/). You only need it to *build calldata* and *read
-state*; the transactions themselves are proposed, signed, and executed from the Safe app
-(`app.safe.global`).
+`cast` is from [Foundry](https://book.getfoundry.sh/). With the [`governance/`](./governance) toolkit you
+do **not** need it for normal operation — the tool builds the calldata, proposes to the Safe Transaction
+Service, and executes. Use `cast` (and the Safe app at `app.safe.global`) to independently verify what
+the tool built, or as a fallback if the Transaction Service is unavailable.
 
 ---
 

@@ -42,6 +42,7 @@ contracts/        Foundry project — the protocol
   test/           Foundry test suite
 WHITEPAPER.md     Protocol specification
 GOVERNANCE.md     Signer runbook (timelock queue/execute, per-op calldata, checklists)
+governance/       Safe multisig tooling (Safe SDK + Transaction Service API; deploy/propose/confirm/execute)
 CLAUDE.md         Codebase guide / conventions
 ```
 

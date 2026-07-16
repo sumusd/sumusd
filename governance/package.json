@@ -1,0 +1,22 @@
+{
+  "name": "sumusd-governance",
+  "version": "0.1.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "type": "module",
+  "description": "API-driven Safe multisig tooling for SumUSD governance (deploy Safes, propose/confirm/execute timelocked operations).",
+  "scripts": {
+    "gov": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@safe-global/api-kit": "^5.0.1",
+    "@safe-global/protocol-kit": "^8.0.4",
+    "viem": "^2.53.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
