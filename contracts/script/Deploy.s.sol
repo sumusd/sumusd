@@ -42,6 +42,9 @@ import {MedianOracleAdapter} from "../src/oracles/MedianOracleAdapter.sol";
 ///   GOVERNANCE — the timelock executor (a multisig). Defaults to the broadcaster (dev only).
 ///   GUARDIAN   — fast brake that can freeze a single collateral. Defaults to the broadcaster.
 ///   DELAY      — timelock delay in seconds (default 345600 = 96h).
+///   GRACE      — how long a matured timelock operation stays executable, in seconds (default 14 days).
+///   CANCELLER  — cancel-only veto on queued timelock operations. Defaults to GUARDIAN, so the fast
+///                multisig can veto a compromised executor's proposal inside the delay window.
 contract Deploy is Script {
     function run()
         external
@@ -57,11 +60,13 @@ contract Deploy is Script {
         address governance = vm.envOr("GOVERNANCE", msg.sender);
         address guardian = vm.envOr("GUARDIAN", msg.sender);
         uint256 delay = vm.envOr("DELAY", uint256(96 hours));
+        uint256 grace = vm.envOr("GRACE", uint256(14 days));
+        address canceller = vm.envOr("CANCELLER", guardian);
 
         vm.startBroadcast();
         address deployer = msg.sender;
 
-        timelock = new ImmutableTimelock(delay, governance);
+        timelock = new ImmutableTimelock(delay, grace, governance, canceller);
         sumUsd = new SumUSD(deployer); // deployer is temporary token admin; handed to the timelock below
         engine = new SumUSDEngine(deployer, sumUsd);
         sumUsd.grantRole(sumUsd.MINTER_ROLE(), address(engine));
@@ -88,6 +93,7 @@ contract Deploy is Script {
         // Fail the deploy loudly if the mint authority or the oracle owners did not end up behind the
         // timelock.
         require(!sumUsd.hasRole(adminRole, deployer), "Deploy: deployer still token admin");
+        require(timelock.CANCELLER() == canceller, "Deploy: timelock canceller not set");
         require(sumUsd.hasRole(adminRole, address(timelock)), "Deploy: timelock not token admin");
         require(sumUsd.hasRole(sumUsd.MINTER_ROLE(), address(engine)), "Deploy: engine not minter");
         require(oracle.owner() == address(timelock), "Deploy: median oracle not timelock-owned");

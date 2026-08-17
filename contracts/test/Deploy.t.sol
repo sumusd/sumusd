@@ -37,7 +37,7 @@ contract DeployTest is Test {
     function setUp() public {
         vm.startPrank(deployer);
         // --- mirrors Deploy.s.sol -----------------------------------------------------------------
-        timelock = new ImmutableTimelock(96 hours, governance);
+        timelock = new ImmutableTimelock(96 hours, 14 days, governance, guardian);
         sumUsd = new SumUSD(deployer);
         engine = new SumUSDEngine(deployer, sumUsd);
         sumUsd.grantRole(sumUsd.MINTER_ROLE(), address(engine));
