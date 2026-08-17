@@ -91,12 +91,80 @@ abstract contract EngineInvariantBase is Test {
         engine.systemCollateralizationRatioBps();
         engine.totalCollateralValueUsd();
         engine.poolNeeds();
+        engine.distressClearsAt();
         address[] memory list = engine.listedCollaterals();
         for (uint256 i; i < list.length; ++i) {
             engine.currentRedeemRateBps(list[i]);
+            engine.marginalRedeemRateBps(list[i]);
+            engine.redeemRateBpsFor(list[i], 1e18);
             engine.collateralValueUsd(list[i]);
             engine.previewRedeem(list[i], 1e18);
         }
+    }
+
+    /// Integrated pricing: the rate a given SIZE pays is never better than the marginal quote. This is
+    /// what stops a self-created imbalance from being cashed out — unwinding a deposit unwinds the share
+    /// that justified its bonus, so a manipulated round trip can never beat an honest one.
+    function invariant_sizedRateNeverBeatsMarginal() public view {
+        address[] memory list = engine.listedCollaterals();
+        for (uint256 i; i < list.length; ++i) {
+            uint256 marginal = engine.marginalRedeemRateBps(list[i]);
+            assertLe(engine.redeemRateBpsFor(list[i], 1e18), marginal, "sized rate beats marginal (small)");
+            assertLe(engine.redeemRateBpsFor(list[i], 1_000e18), marginal, "sized rate beats marginal (large)");
+        }
+    }
+
+    /// A redemption never hands out more than $1 of mark-to-market value per SumUSD burned. The payout is
+    /// price-blind below par (a sub-$1 flavor pays par units, which is what keeps the round-trip arbitrage
+    /// closed) but clamped above it, so an above-$1 flavor cannot be stripped from the pool at par.
+    /// @dev Bounded against the LIVE price only. The clamp is deliberately live-only, because a dead feed
+    ///      must fall back to a flat base rate at par so holders can always exit without the oracle. The
+    ///      residual (a flavor that spikes above $1 and then loses its feed pays par units) is the price of
+    ///      that liveness guarantee.
+    function invariant_neverPaysAbovePar() public view {
+        address[] memory list = engine.listedCollaterals();
+        for (uint256 i; i < list.length; ++i) {
+            (uint256 price, bool ok) = engine.livePriceWad(list[i]);
+            if (!ok) continue;
+            uint256 out = engine.previewRedeem(list[i], 1e18); // token decimals
+            uint256 valueOut = (out * price) / (10 ** _decimalsOf(list[i]));
+            assertLe(valueOut, 1e18, "redemption pays more than $1 of value per SumUSD");
+        }
+    }
+
+    /// A single-flavor (cherry-pick) redemption never SUCCEEDS below the distress entry line. This is the
+    /// anti-run property; the `distressed()` flag itself is observation-driven and may lag a pure price
+    /// move, but `_requireNotDistressed` re-syncs from the live ratio before gating, so the gate cannot be
+    /// stepped around by simply not poking it.
+    function invariant_noCherryPickingBelowTheDistressLine() public view {
+        assertTrue(handler.singleRedeemNeverInDistress(), "single redeem cleared below the distress line");
+    }
+
+    /// The recovery clock only ever runs while the latch is set, and the published clearing time always
+    /// agrees with it.
+    function invariant_distressLatchConsistent() public view {
+        (,, uint256 delay) = engine.distressParams();
+        if (!engine.distressed()) {
+            assertEq(engine.recoveryStartedAt(), 0, "recovery clock runs while healthy");
+            assertEq(engine.distressClearsAt(), 0, "clearing time published while healthy");
+        } else if (engine.recoveryStartedAt() != 0) {
+            assertEq(engine.distressClearsAt(), engine.recoveryStartedAt() + delay, "clearing time disagrees");
+        }
+    }
+
+    /// A de-backed flavor contributes exactly nothing to backing, so the solvency ratio reflects only
+    /// value that can actually be redeemed and distress triggers honestly.
+    function invariant_deBackedFlavorCountsZero() public view {
+        address[] memory list = engine.listedCollaterals();
+        for (uint256 i; i < list.length; ++i) {
+            (,,,, bool excluded) = engine.configs(list[i]);
+            if (excluded) assertEq(engine.collateralValueUsd(list[i]), 0, "de-backed value must read 0");
+        }
+    }
+
+    function _decimalsOf(address token) internal view returns (uint256) {
+        (, uint8 dec,,,) = engine.configs(token);
+        return dec;
     }
 }
 

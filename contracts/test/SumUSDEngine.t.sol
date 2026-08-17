@@ -344,9 +344,18 @@ contract SumUSDEngineTest is Test {
         assertLt(eff, 9700, "scarce flavor is penalized below its base rate");
         assertGt(eff, 0, "but still redeemable, not floored to a revert");
 
+        // A PARTIAL exit still succeeds, penalized. (The tilt is priced on the post-redemption basket,
+        // so the rate a given size pays is strictly worse than the marginal quote above.)
         vm.prank(bob);
-        uint256 out = engine.redeem(address(flavorC), 100e18, 0);
+        uint256 out = engine.redeem(address(flavorC), 25e18, 0);
         assertGt(out, 0, "redemption of a scarce flavor succeeds (penalized, never blocked)");
+        assertLt(out, (25e18 * eff) / BPS, "and pays less than the marginal quote: size is priced in");
+
+        // Draining the WHOLE remaining position in one shot would price to zero, so it reverts rather
+        // than burning for nothing. The holder exits in pieces, or via another flavor.
+        vm.prank(bob);
+        vm.expectPartialRevert(SumUSDEngine.ZeroCollateralOut.selector);
+        engine.redeem(address(flavorC), 75e18, 0);
     }
 
     function test_Tilt_PenaltyGrowsAsFlavorDepletes() public {
@@ -444,13 +453,20 @@ contract SumUSDEngineTest is Test {
         _deposit(bob, flavorB, 100e6);
         _deposit(bob, flavorC, 100e18); // A share 8000 > 6666: 1000*(8000-6666)/10000=133 -> eff 9633
 
+        // 9633 is the MARGINAL rate (share 8000, tilt 1000*(8000-6666)/10000 = 133 over the 9500 base).
         assertEq(engine.currentRedeemRateBps(address(flavorA)), 9633);
+
+        // The rate an actual 100 SumUSD redemption pays is lower, because the tilt is priced on the
+        // POST-redemption basket: A ends at 700/900 = 7777 bps, so the bonus is 1000*(7777-6666)/10000
+        // = 111 over the 9500 base = 9611. Size is priced in rather than the whole trade clearing at the
+        // marginal rate.
+        assertEq(engine.redeemRateBpsFor(address(flavorA), 100e18), 9611, "size-aware rate is below marginal");
 
         uint256 quoted = engine.previewRedeem(address(flavorA), 100e18);
         vm.prank(alice);
         uint256 out = engine.redeem(address(flavorA), 100e18, 0);
-        // netUsd = 100 * 0.9633 = $96.33 -> 96.33 flavor A (6 decimals).
-        assertEq(out, 96_330000, "overweight redemption pays the tilt-improved rate");
+        // netUsd = 100 * 0.9611 = $96.11 -> 96.11 flavor A (6 decimals).
+        assertEq(out, 96_110000, "overweight redemption pays the tilt-improved rate");
         assertEq(quoted, out, "preview matches the actual tilted payout");
     }
 
@@ -547,9 +563,12 @@ contract SumUSDEngineTest is Test {
         // base. (Penalty-direction-only: a freeze can discount a scarce flavor but never raise it.)
         uint256 frozenRateC = engine.currentRedeemRateBps(address(flavorC));
         assertEq(frozenRateC, 8834, "frozen underweight C keeps its convex penalty (below base)");
+        // Redeem a PORTION: the whole position at once would price to zero on the post-redemption basket
+        // (integrated pricing), which reverts rather than paying nothing.
         vm.prank(bob);
-        uint256 outC = engine.redeem(address(flavorC), 100e18, 0);
-        assertEq(outC, 88.34e18, "frozen C redeems at the penalized rate (par), not base");
+        uint256 outC = engine.redeem(address(flavorC), 25e18, 0);
+        assertGt(outC, 0, "frozen C stays redeemable");
+        assertLt(outC, (25e18 * frozenRateC) / BPS, "at the penalized rate (par), with size priced in");
 
         // A's weight/rate is recomputed over enabled flavors only (C dropped), so A's rate changes.
         assertTrue(engine.currentRedeemRateBps(address(flavorA)) != rateBeforeA, "weight excludes frozen C");
