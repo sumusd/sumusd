@@ -38,6 +38,15 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   of a sub-$1 flavor is **not** compensated with extra units (par payout), which removes the
   oracle-redeem leak from the round-trip arb (the residual cross-flavor arb is mint-side, bounded
   by the peg band).
+  **Above-par clamp (one-sided).** The payout is price-blind BELOW $1 (as above) but clamped ABOVE it:
+  when a flavor's live price exceeds $1 the rate is scaled by `WAD/price`, so a redemption never hands
+  out more than **$1 of mark-to-market value per SumUSD burned**. Without it, a flavor trading at $1.05
+  was drained at par during a flight to quality — stripping the pool of its best asset, leaving the
+  impaired one behind, and *lowering* the backing ratio (which also falsified the "redemptions only raise
+  backing" premise behind `redeemBatch`'s single distress check). This is the conservative direction only
+  and does NOT re-open the mint arb, which came from valuing a *low* price *up*. A dead feed falls through
+  to par unchanged, preserving the oracle-independent exit; the residual is that a flavor which spikes
+  above $1 and then loses its feed still pays par units, which is the price of that liveness guarantee.
 - **Convex weight-tilted haircut with a parity band — the *only* balance mechanism.** Each
   flavor has an equal-weight target (`1/funded`). A flavor redeems at its base `redeemRateBps`
   while its weight stays within a wide **parity band, `[target/2, 2×target]`** — moderate imbalance
@@ -46,10 +55,23 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   smaller haircut); below `target/2` a **convex** premium (`tiltSlopeBps × (target/2 − share) / share`)
   that grows without bound as the flavor nears depletion — so draining a scarce flavor is
   self-defeating (last units return ~0) yet **never reverts** (every flavor stays redeemable).
-  Priced on the *pre*-redemption basket and **clamped to [0, 100%]**, so a redemption can never
-  return more than burned face value. `tiltSlopeBps = 0` → flat. Quote the live rate with
-  `currentRedeemRateBps(token)`; `previewRedeem` includes it. (See the adversarial tests for the
-  liveness and anti-griefing properties this gives.)
+  Priced on the ***post*-redemption basket** (integrated, not spot) and **clamped to [0, 100%]**, so a
+  redemption can never return more than burned face value. `tiltSlopeBps = 0` → flat.
+  **Size is priced in:** the rate uses the share the basket will have *after* the redemption settles, so a
+  large exit from a scarce flavor prices strictly worse than the marginal quote, and — critically — a
+  self-created imbalance cannot be cashed out (flash-depositing a flavor to clamp its rate to 100% no
+  longer works, because unwinding the deposit unwinds the share that justified the bonus).
+  **Intra-block manipulation is bounded:** the tilt denominator passes through a block-start basket
+  reference (`basketRefBlock`/`basketRefTotalUsd`, recorded by the first state-changing call of each
+  block), taking whichever of (spot, block-start) is less favorable to the redeemer. So one big deposit
+  cannot collapse every *other* flavor's share below the convex knee and drive their rates to 0 for the
+  rest of the block. Residual by design: holding an inflated position ACROSS a block does move the
+  reference, but that imbalance is real, persistent, and carries capital risk — which is exactly what the
+  tilt exists to price.
+  Quote the marginal rate with `currentRedeemRateBps(token)` / `marginalRedeemRateBps(token)`, the
+  size-aware rate with `redeemRateBpsFor(token, amount)`; `previewRedeem` includes both plus the margin.
+  (See `test/Manipulation.t.sol` for the exploit regressions and the adversarial tests for the liveness
+  and anti-griefing properties.)
 - **Deposit nudge.** `poolNeeds()` returns the enabled flavor with the smallest USD balance (the
   most under-represented), **skipping any flavor whose feed is currently unpriceable** (it can't be
   deposited anyway). The frontend defaults the deposit selector to it and labels "the pool needs
@@ -59,10 +81,13 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   without touching supply. The intended way to lift backing back above the mint floor / distress line
   (redemptions don't heal the ratio in distress; `redeemMix` is ratio-flat). Works for a frozen-but-
   listed collateral; reads received balance (fee-on-transfer safe); can only ever raise backing.
-- **Dust-redeem guard.** Single-flavor `redeem` reverts (`ZeroCollateralOut`) if a *positive-rate*
-  redemption would round to 0 collateral (dust input), instead of burning SumUSD for nothing. A flavor
-  the convex tilt has priced to a rate of *exactly* 0 still returns 0 without reverting (preserves the
-  "tilt never gates" liveness property — holders exit via another flavor or `redeemMix`).
+- **Zero-payout guard.** Single-flavor `redeem` reverts (`ZeroCollateralOut`) whenever the payout is 0
+  **and the flavor's MARGINAL rate is positive** — i.e. the zero came from *size* (dust input, or a
+  request larger than the convex curve will serve under post-redemption pricing) rather than from
+  depletion. A flavor the tilt has priced to a rate of exactly 0 at the margin still returns 0 without
+  reverting (preserves the "tilt never gates" liveness property — holders exit via another flavor or
+  `redeemMix`). `redeemMix` has the same guard: it reverts if *every* leg would be 0, while still
+  allowing partial zeros (an empty or blacklisted flavor must stay skippable).
 - **Batch redeem (`redeemBatch`).** `redeemBatch(collaterals[], sumUsdAmounts[], minOuts[])` redeems
   several flavors in one transaction — each leg priced and paid exactly as an individual `redeem`.
   All legs share **one pre-batch basket snapshot** (`_basketStats` read once), so the leg order never
@@ -81,19 +106,37 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   `systemCollateralizationRatioBps()` is below `MIN_MINT_RATIO_BPS` (a hard-coded constant,
   **99%** — not governance-settable), checked on the pre-deposit snapshot. The 1% slack below par
   accommodates collateral that normally trades just under $1 (e.g. ~0.999); a genuine de-peg still
-  pauses minting. The first deposit (zero supply → "infinite" backing) is always allowed; minting
+  pauses minting. **Load-bearing coupling (now asserted in the constructor):**
+  `MIN_MINT_RATIO_BPS <= BPS - MAX_DEPOSIT_PRICE_DEVIATION_BPS` (9900 <= 9950). Par minting accepts
+  collateral worth as little as $0.9950 while minting $1 of supply, so unbounded worst-case in-band
+  deposits drive backing asymptotically toward 99.50% and no further — which is what makes it impossible
+  to grief the system into distress with deposits alone. The 50 bps of slack IS the margin; widening the
+  peg band to 100 bps would silently delete it. The first deposit (zero supply → "infinite" backing) is always allowed; minting
   auto-resumes once backing recovers to ≥ 99%. This makes `systemCollateralizationRatioBps()`
   load-bearing on the mint path. Redemptions remain open regardless.
-- **Distress mode / anti-run (`redeemMix`).** Below `DISTRESS_RATIO_BPS` (99%, == the mint floor)
-  the pick-your-flavor `redeem` is disabled (reverts `UseRedeemMix`) and holders exit via
+- **Distress mode / anti-run (`redeemMix`), LATCHED with hysteresis.** Below
+  `DISTRESS_ENTER_RATIO_BPS` (99%, == the mint floor) the system latches `distressed = true`
+  (instantly — a safety action never waits) and the pick-your-flavor `redeem` is disabled (reverts
+  `UseRedeemMix`); holders exit via
   **`redeemMix(amount, minOut[])`** — a pro-rata claim returning `amount / totalSupply` of **every**
   listed collateral (enabled and frozen). This shares the shortfall equally regardless of redemption
   order (kills the first-redeemer run), keeps the backing ratio flat as holders exit, and uses **no
   oracle / no haircut / no tilt** (pure ownership math, robust to dead feeds). A flavor whose
   transfer **fails** (e.g. its issuer blacklisted the engine) is **skipped, not reverted**
   (`_tryTransfer`), so one stuck collateral can't brick the whole exit — its slice stays pooled and
-  `amounts[i]` reports 0. `redeemMix` reverts `NotDistressed` at/above 99%; single-flavor `redeem`
+  `amounts[i]` reports 0. `redeemMix` reverts `NotDistressed` while not latched; single-flavor `redeem`
   is the path there. Views: `previewRedeemMix`, `listedCollaterals`.
+  **The latch clears only** once backing has held at/above `DISTRESS_EXIT_RATIO_BPS` (**100.25%**) for
+  `DISTRESS_RECOVERY_DELAY` (**6h**), continuously — any reading below the exit line restarts the clock.
+  The hysteresis is essential, not cosmetic: a par redemption at an effective rate equal to the current
+  ratio is **ratio-NEUTRAL**, so with a bare threshold a whale could `donate` a dust amount to re-cross
+  99%, then cherry-pick-drain the healthy flavor indefinitely without ever re-tripping the gate (the
+  ratio simply doesn't move). Requiring a genuine recapitalization above 100% closes that.
+  The latch is observation-driven: every state-changing entry point syncs it, and the permissionless
+  **`pokeDistress()`** keeper hook advances the countdown when the system is otherwise idle. A price move
+  alone does not update the flag, but `_requireNotDistressed` re-syncs from the live ratio *before*
+  gating, so the gate can never be stepped around by simply not poking it. Views: `distressed`,
+  `recoveryStartedAt`, `distressClearsAt()`, `distressParams()`.
 - **Deposits are uncapped** (no deposit-size limit). Balance is maintained entirely by the convex
   tilt + the `poolNeeds()` nudge above.
 
@@ -130,6 +173,17 @@ Consequences worth internalizing:
   base rate** — so freezing can never trap holders (`redeem` only rejects *unlisted* collateral).
   Uses `Ownable2Step`, `ReentrancyGuard`, `SafeERC20`; reads actual received balance to stay safe
   against fee-on-transfer tokens.
+  **One basket pass.** `_basketSnapshot()` returns `(backingUsd, enabledUsd, funded)` from a SINGLE loop;
+  `redeem` used to walk the whole basket twice (once for the distress ratio, once for the tilt weights),
+  pricing every flavor through the oracle stack twice. Measured at 24 flavors x 3 sources: redeem
+  1,006k -> 535k gas. Deposit gains ~25k on the first call of each block (the block-start tilt reference
+  write), amortized across every later call in that block. `_redeemRateWithRecord` also folds the
+  last-good price cache write into the same oracle read the rate already needed.
+  **`funded` has a value floor** (`MIN_FUNDED_VALUE_WAD` = $1): `funded` sets BOTH parity band edges, so
+  without it anyone could shift every rate in the basket by dusting an empty listed flavor (1 wei of a
+  6-decimal token values at 1e12 WAD, i.e. non-zero). It also removes the cliff at the bottom of a drain.
+  Backing accounting is unaffected — a sub-floor balance still counts in full toward
+  `totalCollateralValueUsd`.
 - **De-back / silo (`setCollateralBackingExcluded`, owner/timelock).** For a permanently-inaccessible
   flavor (e.g. issuer blacklisted the engine so its balance is stuck but `balanceOf`/oracle still read
   normally): sets `CollateralConfig.backingExcluded`, which makes `collateralValueUsd` return 0 →
@@ -139,9 +193,34 @@ Consequences worth internalizing:
   `redeemMix` still shares its (skipped) slice pro-rata; `rawCollateralValueUsd` still reports the
   stranded value. Reversible. Orthogonal to `freezeCollateral` (fast/exposure vs slow/accounting); a
   permanent blacklist warrants both. This is the fix for backlog #7.
+  **A de-backed flavor is NOT depositable** (`deposit` reverts `CollateralBackingExcluded`): it
+  contributes 0 to backing, so minting against it 1:1 would dilute every holder on the spot. The engine
+  enforces the pairing rather than trusting governance to remember the freeze. It also takes the
+  **penalty-direction-only** tilt path (same as a frozen flavor), since it is excluded from the basket
+  stats and must not be measured against a basket it is not part of.
 - `ImmutableTimelock.sol` — minimal timelock with an **`immutable DELAY`** (no `setDelay`, no
   bypass). Intended as the engine's owner: every `setCollateral`/`setTiltSlopeBps` call must be
-  `queue`d and wait the delay before `execute`. `renounceExecutor()` freezes the engine forever.
+  `queue`d and wait the delay before `execute`. Three rails around it:
+  - **`immutable CANCELLER`** — a cancel-only veto (point it at the guardian Safe). It can `cancel` any
+    queued operation but can never queue or execute one, so granting it costs no extra authority. This is
+    the lever a compromised executor cannot strip: without it, the delay gives holders *notice* but gives
+    defenders *nothing*. Constructor arg; immutable for the same reason `executor` is (rotation happens
+    inside the multisig).
+  - **`immutable GRACE_PERIOD`** (reference 14 days) — a matured operation is executable only within
+    `[eta, eta + GRACE_PERIOD]`, then reverts `Expired` and must be re-queued. Stops a forgotten proposal
+    from landing years later against changed assumptions.
+  - **Two-step renounce** — `initiateRenounce()` → wait `DELAY` → `renounceExecutor()`, abortable via
+    `abortRenounce()`. Renouncing freezes the engine forever *including* the ability to re-point a
+    deprecated price feed, so it is not a single call.
+- `oracles/MedianOracleAdapter.sol` — medians N `IPriceOracle` sources per token with a `minFresh`
+  quorum and an optional `maxSpreadBps` breaker. **`MAX_SOURCES = 5`** (lowered from 7): every source is
+  a feed read multiplied by every listed collateral on the engine's hot path, so the cap is a direct
+  multiplier on redemption gas. 5 still allows a 3-of-5 quorum with two spare providers.
+- `oracles/ChainlinkOracleAdapter.sol` — fail-closed AggregatorV3 wrapper. Also carries an optional
+  **L2 sequencer uptime gate** (`setSequencerFeed(feed, gracePeriod)`, unset on L1): after a sequencer
+  outage the first blocks back replay a burst of updates carrying *fresh* timestamps, so `maxStaleness`
+  alone passes prices that reflect a market which moved without them. Reject until the network has been
+  live for the grace period (reference: 1h).
 - `interfaces/IPriceOracle.sol` — `getPriceWad(token)` returns a USD price scaled to **1e18**
   (a WAD: `1e18` == $1.00). All engine math normalizes through this WAD.
 
@@ -157,7 +236,7 @@ sanity-railed: `setCollateral` rejects a `redeemRateBps` outside the immutable
 anything above **`MAX_TILT_SLOPE_BPS` = 5000**, and `setRedeemMargin` rejects a total above
 **`MAX_REDEEM_MARGIN_BPS` = 5** (or a routed portion exceeding the total) — so governance can tune the
 base rate, tilt, and margin but never set a punitive payout, an unredeemable slope, or an exit margin above
-2 bps. `setMarginRecipient` sets the margin's destination (all owner/timelock-gated).
+5 bps (0.05%). `setMarginRecipient` sets the margin's destination (all owner/timelock-gated).
 
 **Collateral-list cap:** the basket is capped at `MAX_COLLATERALS` (24) so the basket-wide loops
 can't grow unbounded; `removeCollateral` de-lists a **disabled + zero-balance** collateral
