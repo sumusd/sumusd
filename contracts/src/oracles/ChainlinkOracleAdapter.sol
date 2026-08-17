@@ -35,6 +35,20 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     /// @notice Feed configuration per collateral token.
     mapping(address token => FeedConfig config) public feeds;
 
+    /// @notice Optional L2 Sequencer Uptime Feed. When set, every {getPriceWad} additionally requires that
+    ///         the sequencer is up AND has been up for `sequencerGracePeriod`. Leave unset (address(0)) on
+    ///         L1, where there is no sequencer.
+    /// @dev This closes a gap that `maxStaleness` alone cannot: after a sequencer outage the first blocks
+    ///      back replay a burst of feed updates carrying FRESH timestamps, so every price passes the
+    ///      staleness check while actually reflecting a market that moved without them. Users also had no
+    ///      way to react during the outage. The grace period is the standard mitigation: reject prices
+    ///      until the network has been live long enough for feeds and users to catch up.
+    address public sequencerUptimeFeed;
+    /// @notice How long the sequencer must have been continuously up before prices are accepted again.
+    uint32 public sequencerGracePeriod;
+
+    event SequencerFeedConfigured(address indexed feed, uint32 gracePeriod);
+
     event FeedConfigured(
         address indexed token,
         address indexed aggregator,
@@ -54,6 +68,8 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     error StaleRound(address token, uint80 roundId, uint80 answeredInRound);
     error StalePrice(address token, uint256 updatedAt, uint256 nowTs);
     error PriceOutOfSaneBand(address token, uint256 priceWad);
+    error SequencerDown();
+    error SequencerGracePeriod(uint256 upSince, uint256 readyAt);
 
     constructor(address admin) Ownable(admin) {}
 
@@ -88,6 +104,16 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
         emit FeedConfigured(token, aggregator, feedDecimals, maxStaleness, minPriceWad, maxPriceWad);
     }
 
+    /// @notice Configure (or clear, with `feed == address(0)`) the L2 Sequencer Uptime Feed and the grace
+    ///         period that must elapse after the sequencer comes back before prices are trusted again.
+    ///         Leave cleared on L1. Owner (timelock) only.
+    /// @dev Reference L2 configuration: the network's canonical uptime feed with a 1 hour grace period.
+    function setSequencerFeed(address feed, uint32 gracePeriod) external onlyOwner {
+        sequencerUptimeFeed = feed;
+        sequencerGracePeriod = gracePeriod;
+        emit SequencerFeedConfigured(feed, gracePeriod);
+    }
+
     /// @notice Remove the feed for `token`. Subsequent {getPriceWad} calls revert `FeedNotConfigured`,
     ///         so the engine values the collateral at 0 (conservative) until a feed is set again.
     function removeFeed(address token) external onlyOwner {
@@ -104,6 +130,8 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     /// @dev Reverts (fail-closed) unless the latest round is positive, complete, fresh within
     ///      `maxStaleness`, not a carried-over stale answer, and within the configured sane band.
     function getPriceWad(address token) external view returns (uint256 priceWad) {
+        _requireSequencerUp();
+
         FeedConfig memory f = feeds[token];
         if (f.aggregator == address(0)) revert FeedNotConfigured(token);
 
@@ -124,6 +152,20 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     // ---------------------------------------------------------------------
     // Internal
     // ---------------------------------------------------------------------
+
+    /// @dev Revert unless the L2 sequencer is up and has been up for `sequencerGracePeriod`. No-op when no
+    ///      sequencer feed is configured (the L1 case). The uptime feed reports `answer == 0` for up and
+    ///      `1` for down, with `startedAt` marking when the current status began.
+    function _requireSequencerUp() internal view {
+        address feed = sequencerUptimeFeed;
+        if (feed == address(0)) return;
+        (, int256 answer, uint256 startedAt,,) = AggregatorV3Interface(feed).latestRoundData();
+        if (answer != 0) revert SequencerDown();
+        // startedAt == 0 means the uptime feed itself is not yet initialized: fail closed.
+        if (startedAt == 0) revert SequencerDown();
+        uint256 readyAt = startedAt + sequencerGracePeriod;
+        if (block.timestamp < readyAt) revert SequencerGracePeriod(startedAt, readyAt);
+    }
 
     /// @dev Scale a feed answer from `feedDecimals` to an 18-decimal WAD.
     function _scaleToWad(uint256 answer, uint8 feedDecimals) internal pure returns (uint256) {
