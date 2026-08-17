@@ -90,14 +90,19 @@ export async function listPending(safe: Address): Promise<PendingTx[]> {
     }));
 }
 
-/// Read a timelocked operation's id and earliest-execution timestamp (0 = not queued).
-export async function opStatus(inner: InnerCall, salt: Hex): Promise<{id: Hex; eta: bigint; delay: bigint}> {
+/// Read a timelocked operation's id, earliest-execution timestamp (0 = not queued), and the window it
+/// stays executable for. A matured operation expires at `eta + grace` and must then be re-queued.
+export async function opStatus(
+    inner: InnerCall,
+    salt: Hex,
+): Promise<{id: Hex; eta: bigint; delay: bigint; grace: bigint}> {
     const pc = publicClient();
     const timelock = config.timelock();
-    const [id, delay] = await Promise.all([
+    const [id, delay, grace] = await Promise.all([
         pc.readContract({address: timelock, abi: GOV_ABI, functionName: "operationId", args: [inner.target, inner.data, salt]}),
         pc.readContract({address: timelock, abi: GOV_ABI, functionName: "DELAY"}),
+        pc.readContract({address: timelock, abi: GOV_ABI, functionName: "GRACE_PERIOD"}),
     ]);
     const eta = await pc.readContract({address: timelock, abi: GOV_ABI, functionName: "eta", args: [id]});
-    return {id, eta, delay};
+    return {id, eta, delay, grace};
 }

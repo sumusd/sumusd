@@ -72,6 +72,7 @@ Commands:
   queue    <op> [args] --salt <label>       propose timelock.queue(op)   from the gov Safe
   execute  <op> [args] --salt <label>       propose timelock.execute(op) from the gov Safe (after delay)
   cancel   <op> [args] --salt <label>       propose timelock.cancel(op)  from the gov Safe
+                                           (add --safe <cancellerSafe> to veto from the guardian Safe)
   direct   <op> [args] [--safe gov|guardian|0x..]   propose a direct (non-timelocked) Safe call
   status   <op> [args] --salt <label>       read the operation id + eta from the timelock
   encode   <op> [args]                      print the inner call (target + calldata), no proposal
@@ -117,9 +118,14 @@ async function main() {
             if (!op.timelocked) throw new Error(`"${positionals[1]}" is a direct op; use \`gov direct ${positionals[1]}\` instead`);
             const salt = saltFrom(requireSalt(flags));
             const wrapped = wrapTimelock(command, op, salt);
+            // cancel is the one operation the CANCELLER Safe may also send, so it accepts --safe. This is
+            // the veto path: if the gov Safe is compromised, the guardian Safe kills its queued op inside
+            // the delay window without ever being able to queue or execute anything itself.
+            const proposer =
+                command === "cancel" ? resolveSafe(str(flags, "safe"), () => config.govSafe()) : config.govSafe();
             console.log(`Inner: ${op.description}`);
-            console.log(`Safe tx: timelock.${command}(${op.target}, <data>, ${salt}) from the gov Safe`);
-            const safeTxHash = await proposeSafeTx(config.govSafe(), wrapped.to, wrapped.data);
+            console.log(`Safe tx: timelock.${command}(${op.target}, <data>, ${salt}) from ${proposer}`);
+            const safeTxHash = await proposeSafeTx(proposer, wrapped.to, wrapped.data);
             console.log(`Proposed. safeTxHash: ${safeTxHash}`);
             console.log(`Next: other owners run \`gov confirm ${safeTxHash}\`, then \`gov exec ${safeTxHash}\`.`);
             return;
@@ -140,14 +146,19 @@ async function main() {
         case "status": {
             const op = buildOp(positionals[1], positionals.slice(2));
             const salt = saltFrom(requireSalt(flags));
-            const {id, eta, delay} = await opStatus(op, salt);
+            const {id, eta, delay, grace} = await opStatus(op, salt);
             console.log(`Operation: ${op.description}`);
             console.log(`  id:    ${id}`);
             console.log(`  eta:   ${fmtEta(eta)}`);
             console.log(`  delay: ${delay}s`);
+            console.log(`  grace: ${grace}s`);
             if (eta !== 0n) {
-                const ready = BigInt(Math.floor(Date.now() / 1000)) >= eta;
-                console.log(`  ${ready ? "READY to execute" : "waiting for the delay to elapse"}`);
+                const now = BigInt(Math.floor(Date.now() / 1000));
+                const expiresAt = eta + grace;
+                console.log(`  expires: ${fmtEta(expiresAt)}`);
+                if (now > expiresAt) console.log("  EXPIRED - re-queue it (a new salt is not required)");
+                else if (now >= eta) console.log("  READY to execute");
+                else console.log("  waiting for the delay to elapse");
             }
             return;
         }

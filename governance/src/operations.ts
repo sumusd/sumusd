@@ -211,7 +211,6 @@ export const OPERATIONS: Record<string, Op> = {
             timelocked: true,
         }),
     },
-    // --- direct ops (no timelock wrap) ---
     freeze: {
         help: "freeze <token>                            [DIRECT, guardian Safe] engine.freezeCollateral(token)",
         build: (a) => ({
@@ -221,12 +220,53 @@ export const OPERATIONS: Record<string, Op> = {
             timelocked: false,
         }),
     },
+    "set-sequencer-feed": {
+        help: "set-sequencer-feed <provider> <feed> <graceSecs>   L2 sequencer uptime gate (0x0 to clear on L1)",
+        build: (a) => ({
+            target: addr(a[0], "provider"),
+            data: encodeFunctionData({
+                abi: GOV_ABI,
+                functionName: "setSequencerFeed",
+                args: [addr(a[1], "sequencerFeed"), Number(u(a[2], "gracePeriod"))],
+            }),
+            description: `provider(${a[0]}).setSequencerFeed(${a[1]}, ${a[2]})`,
+            timelocked: true,
+        }),
+    },
+    // --- direct ops (no timelock wrap) ---
+    "poke-distress": {
+        help: "poke-distress                             [DIRECT, anyone] engine.pokeDistress() — advance the recovery clock",
+        build: () => ({
+            target: config.engine(),
+            data: encodeFunctionData({abi: GOV_ABI, functionName: "pokeDistress"}),
+            description: "engine.pokeDistress()  (starts/advances the distress recovery countdown)",
+            timelocked: false,
+        }),
+    },
+    "initiate-renounce": {
+        help: "initiate-renounce                         [DIRECT, gov Safe] timelock.initiateRenounce() — starts the TERMINAL countdown",
+        build: () => ({
+            target: config.timelock(),
+            data: encodeFunctionData({abi: GOV_ABI, functionName: "initiateRenounce"}),
+            description: "timelock.initiateRenounce()  (step 1 of 2; waits DELAY, abortable)",
+            timelocked: false,
+        }),
+    },
+    "abort-renounce": {
+        help: "abort-renounce                            [DIRECT, gov Safe] timelock.abortRenounce()",
+        build: () => ({
+            target: config.timelock(),
+            data: encodeFunctionData({abi: GOV_ABI, functionName: "abortRenounce"}),
+            description: "timelock.abortRenounce()",
+            timelocked: false,
+        }),
+    },
     "renounce-executor": {
-        help: "renounce-executor                         [DIRECT, gov Safe] timelock.renounceExecutor() — TERMINAL",
+        help: "renounce-executor                         [DIRECT, gov Safe] timelock.renounceExecutor() — TERMINAL, needs initiate-renounce + DELAY",
         build: () => ({
             target: config.timelock(),
             data: encodeFunctionData({abi: GOV_ABI, functionName: "renounceExecutor"}),
-            description: "timelock.renounceExecutor()  (freezes all parameters forever)",
+            description: "timelock.renounceExecutor()  (step 2 of 2; freezes all parameters forever)",
             timelocked: false,
         }),
     },
