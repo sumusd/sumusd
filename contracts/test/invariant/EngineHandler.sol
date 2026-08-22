@@ -29,6 +29,7 @@ contract EngineHandler is Test {
     uint256 public ghostMinted; // total SumUSD minted across all successful deposits
     uint256 public ghostBurned; // total SumUSD burned across all successful redeems / redeemMix
     bool public redeemMixFair = true; // set false if any redeemMix ever reduced the backing ratio
+    bool public singleRedeemNeverInDistress = true; // set false if a single-flavor redeem ever cleared below the line
 
     constructor(
         SumUSDEngine _engine,
@@ -82,9 +83,17 @@ contract EngineHandler is Test {
         uint256 bal = sumUsd.balanceOf(actor);
         if (bal == 0) return;
         amount = bound(amount, 1, bal);
+        // Snapshot the ratio the redemption is actually priced against. The distress latch is an
+        // observation-driven state machine (a price move alone does not update it), so the property that
+        // matters is not "the flag tracks the ratio at all times" but this: a single-flavor redemption can
+        // never SUCCEED below the entry line. `_requireNotDistressed` syncs the latch from the live ratio
+        // before gating, so cherry-picking must be impossible there regardless of when it was last poked.
+        uint256 ratioBefore = engine.systemCollateralizationRatioBps();
         vm.prank(actor);
         try engine.redeem(collaterals[colSeed % collaterals.length], amount, 0) {
             ghostBurned += amount;
+            (uint256 enterBps,,) = engine.distressParams();
+            if (ratioBefore < enterBps) singleRedeemNeverInDistress = false;
         } catch {}
     }
 

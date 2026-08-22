@@ -11,6 +11,11 @@ export const GOV_ABI = parseAbi([
     "function eta(bytes32 id) view returns (uint256)",
     "function executor() view returns (address)",
     "function DELAY() view returns (uint256)",
+    "function GRACE_PERIOD() view returns (uint256)",
+    "function CANCELLER() view returns (address)",
+    "function renounceEta() view returns (uint256)",
+    "function initiateRenounce()",
+    "function abortRenounce()",
     "function renounceExecutor()",
     // --- SumUSDEngine (inner calls, wrapped in the timelock; freezeCollateral is a direct guardian call) ---
     "function acceptOwnership()",
@@ -24,12 +29,14 @@ export const GOV_ABI = parseAbi([
     "function setStalePriceParams(uint32 graceSeconds, uint16 haircutBps)",
     "function setGuardian(address newGuardian)",
     "function freezeCollateral(address token)",
+    "function pokeDistress()",
     // --- SumUSD token (roles) ---
     "function grantRole(bytes32 role, address account)",
     "function revokeRole(bytes32 role, address account)",
     // --- ChainlinkOracleAdapter (a provider) ---
     "function setFeed(address token, address aggregator, uint32 maxStaleness, uint128 minPriceWad, uint128 maxPriceWad)",
     "function removeFeed(address token)",
+    "function setSequencerFeed(address feed, uint32 gracePeriod)",
     // --- MedianOracleAdapter ---
     "function setSources(address token, address[] sources, uint32 minFresh, uint32 maxSpreadBps)",
     "function removeSources(address token)",

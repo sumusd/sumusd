@@ -114,25 +114,26 @@ contract MedianOracleAdapterTest is Test {
     }
 
     function test_MaxSourcesAllowedAtRail() public {
-        // Exactly MAX_SOURCES (7) is accepted.
-        IPriceOracle[] memory seven = new IPriceOracle[](7);
-        for (uint256 i; i < 7; ++i) {
+        // Exactly MAX_SOURCES (5) is accepted.
+        IPriceOracle[] memory five = new IPriceOracle[](5);
+        for (uint256 i; i < 5; ++i) {
             MockOracle m = new MockOracle();
             m.setPrice(token, 1e18);
-            seven[i] = m;
+            five[i] = m;
         }
         vm.prank(owner);
-        median.setSources(token, seven, 1, 0);
+        median.setSources(token, five, 3, 0);
         (IPriceOracle[] memory got, uint32 mf,) = median.sourcesOf(token);
-        assertEq(got.length, 7, "7 sources configured");
-        assertEq(mf, 1);
-        assertEq(median.getPriceWad(token), 1e18, "median of 7 identical sources");
+        assertEq(got.length, 5, "5 sources configured");
+        assertEq(mf, 3, "a 3-of-5 quorum still fits under the rail");
+        assertEq(median.getPriceWad(token), 1e18, "median of 5 identical sources");
     }
 
     function test_Revert_TooManySources() public {
-        // 8 sources exceeds the MAX_SOURCES (7) rail.
-        IPriceOracle[] memory tooMany = new IPriceOracle[](8);
-        for (uint256 i; i < 8; ++i) {
+        // 6 sources exceeds the MAX_SOURCES (5) rail. The cap was lowered from 7 because every source
+        // is re-read for every listed collateral on the engine's redemption path.
+        IPriceOracle[] memory tooMany = new IPriceOracle[](6);
+        for (uint256 i; i < 6; ++i) {
             tooMany[i] = new MockOracle();
         }
         vm.prank(owner);

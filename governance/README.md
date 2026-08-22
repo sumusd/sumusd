@@ -2,8 +2,8 @@
 
 Scripts that drive SumUSD governance entirely through the **Safe{Core} SDK** and the **Safe Transaction
 Service API** — no web UI. They deploy the Safes, and propose / confirm / execute every privileged
-operation (all of which flow through the `ImmutableTimelock`, except the guardian freeze and the terminal
-`renounceExecutor`).
+operation (all of which flow through the `ImmutableTimelock`, except the guardian freeze, the guardian's
+cancel-only veto, the permissionless `pokeDistress`, and the terminal renounce).
 
 This is the executable companion to [`../GOVERNANCE.md`](../GOVERNANCE.md), which explains the topology
 and the meaning of each operation. Read that first.
@@ -11,6 +11,7 @@ and the meaning of each operation. Read that first.
 ```
 Governance Safe (M-of-N) ──queue/execute──▶ ImmutableTimelock (96h) ──owns──▶ Engine / Token / Oracles
 Guardian Safe (M-of-N)   ──────direct──────▶ Engine.freezeCollateral   (the one fast lever)
+                         ──────direct──────▶ Timelock.cancel           (the veto; CANCELLER)
 ```
 
 ## Setup
@@ -76,14 +77,22 @@ engine handover).
 # Guardian instant freeze (from the guardian Safe)
 npm run gov -- direct freeze <token>            # --safe defaults to the guardian Safe
 
-# Terminal: renounce the executor (from the gov Safe) — freezes all parameters forever
-npm run gov -- direct renounce-executor
+# Keeper: advance the distress recovery countdown (anyone)
+npm run gov -- direct poke-distress
+
+# Terminal: renounce the executor (from the gov Safe) — freezes all parameters forever.
+# Two-step: initiate, wait the full DELAY (abortable), then complete.
+npm run gov -- direct initiate-renounce
+npm run gov -- direct abort-renounce            # cancels a pending renounce
+npm run gov -- direct renounce-executor         # only after the delay elapses
 ```
 
 ## Other commands
 
 ```bash
 npm run gov -- cancel set-tilt 500 --salt <label>   # abort a queued op before it executes
+npm run gov -- cancel set-tilt 500 --salt <label> --safe $GUARDIAN_SAFE   # ...as the CANCELLER (veto)
+npm run gov -- status set-tilt 500 --salt <label>  # id, eta, grace window, READY / EXPIRED
 npm run gov -- list                                 # pending Safe txs + confirmation progress
 npm run gov -- encode set-collateral <token> true 9900   # print target + calldata (no proposal)
 ```

@@ -21,12 +21,18 @@ web app lives in a separate repo: **[sumusd/website](https://github.com/sumusd/w
   scarce one gets steeply more expensive (self-defeating, but never blocked). The haircut stays in
   the pool, so mark-to-market backing trends above 100% over time — the source of
   over-collateralization.
-- **Anti-run distress mode.** Below 99% backing, single-flavor redemption is disabled in favor of
-  `redeemMix`, a pro-rata claim on the whole basket that shares any shortfall equally across holders.
+- **Anti-run distress mode, latched.** Below 99% backing, single-flavor redemption is disabled in favor
+  of `redeemMix`, a pro-rata claim on the whole basket that shares any shortfall equally across holders.
+  Entry is instant; clearing it requires backing to hold above 100.25% for six hours, so the gate cannot
+  be re-crossed with a dust donation and then drained.
+- **Manipulation-resistant pricing.** The haircut is priced on the *post*-redemption basket and against a
+  block-start reference, so a flash-loaned deposit can neither buy itself a zero-haircut exit nor crush
+  another holder's redemption rate to zero.
 - **Minimal, slow governance.** There is no global pause. Parameters are owned by an
-  `ImmutableTimelock` (96h delay), leaving holders a guaranteed exit window; the one fast lever is a
-  `guardian` that can freeze a single misbehaving collateral. The core safety rails (peg band, mint
-  floor, redeem-rate / tilt / margin caps) are immutable with no setter.
+  `ImmutableTimelock` (96h delay, 14-day execution window, cancel-only veto held by the guardian),
+  leaving holders a guaranteed exit window; the one fast lever is a `guardian` that can freeze a single
+  misbehaving collateral. The core safety rails (peg band, mint floor, distress thresholds, redeem-rate /
+  tilt / margin caps) are immutable with no setter.
 - **Small redemption margin.** 2 bps on single-flavor redemption (immutably capped, timelock-set): 1 bp
   is retained as backing and 1 bp is routed to a governance-set recipient. The distress exit is exempt.
 

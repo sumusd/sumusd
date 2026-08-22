@@ -22,13 +22,19 @@ Governance Safe (M-of-N)  ──queue/execute──▶  ImmutableTimelock (96h d
                                                                               ──owns──▶  ChainlinkOracleAdapter x2 (providers)
 
 Guardian Safe (M-of-N)    ──────direct, instant──────▶  SumUSDEngine.freezeCollateral   (the one fast lever)
+                          ──────direct, instant──────▶  ImmutableTimelock.cancel        (the veto)
 ```
 
 - **Every** privileged change to the engine, token, or oracle adapters goes through the timelock:
   **queue it, wait the immutable delay (96h by default), then execute it.** There is no bypass.
 - The **guardian** is the only fast path. It can call `freezeCollateral(token)` directly (no delay), and
-  nothing else.
-- `renounceExecutor()` on the timelock is terminal: it freezes every parameter forever.
+  it is also the timelock's immutable **`CANCELLER`**: it can veto any queued operation, but can never
+  queue or execute one. That is the lever a compromised governance Safe cannot strip — the delay alone
+  gives holders notice, the veto gives defenders a response.
+- **Queued operations expire.** A matured op is executable only within `[eta, eta + GRACE_PERIOD]`
+  (14 days by default), then must be re-queued. Check `gov status <op> --salt <label>`.
+- `renounceExecutor()` on the timelock is terminal. It is two-step: `initiateRenounce()`, wait the full
+  delay (abortable with `abortRenounce()`), then `renounceExecutor()`.
 
 There is intentionally **no global pause**: deposits and redemptions can never be halted wholesale, so
 holders can always exit.
@@ -106,10 +112,15 @@ Collect the M signatures and execute. Then wait the delay and repeat for `execut
 # operation id, then its ready-at timestamp (0 = not queued)
 ID=$(cast call $TIMELOCK "operationId(address,bytes,bytes32)(bytes32)" $ENGINE $DATA $SALT --rpc-url $RPC)
 cast call $TIMELOCK "eta(bytes32)(uint256)" $ID --rpc-url $RPC     # execute allowed once block.timestamp >= this
+cast call $TIMELOCK "GRACE_PERIOD()(uint256)" --rpc-url $RPC       # ...and only until eta + this
 
-# to abort a queued op before it executes (Safe tx to TIMELOCK):
+# to abort a queued op before it executes (Safe tx to TIMELOCK).
+# Sendable from the governance Safe OR from the CANCELLER (the guardian Safe):
 cast calldata "cancel(address,bytes,bytes32)" $ENGINE $DATA $SALT
 ```
+
+With the toolkit: `npm run gov -- cancel <op> [args] --salt <label>` proposes from the governance Safe;
+add `--safe $GUARDIAN_SAFE` to veto from the canceller instead.
 
 ---
 
@@ -125,8 +136,10 @@ queue/execute per §3 unless marked otherwise.
 | Accept engine ownership | `$ENGINE` | `acceptOwnership()` |
 
 `Deploy.s.sol` already grants the token admin to the timelock, renounces the deployer's, sets the
-guardian, and deploys the oracle adapters owned by the timelock. The **one** remaining step is
-accepting the two-step engine ownership. Build `DATA=$(cast calldata "acceptOwnership()")` and run the
+guardian, and deploys the oracle adapters owned by the timelock. It reads `GOVERNANCE`, `GUARDIAN`,
+`DELAY` (default 96h), `GRACE` (default 14 days), and `CANCELLER` (defaults to `GUARDIAN`) from the
+environment, and asserts the canceller landed. The **one** remaining step is accepting the two-step
+engine ownership. Build `DATA=$(cast calldata "acceptOwnership()")` and run the
 queue/execute cycle with `target = $ENGINE`.
 
 ### Collateral management (target `$ENGINE`)
@@ -152,6 +165,7 @@ Provider feeds (target `$PROVIDER1` / `$PROVIDER2`):
 |---|---|
 | Point a provider at a Chainlink feed | `setFeed(address,address,uint32,uint128,uint128)` — `(token, aggregator, maxStaleness, minPriceWad, maxPriceWad)` |
 | Remove a provider feed | `removeFeed(address)` — `(token)` |
+| Set the L2 sequencer uptime gate | `setSequencerFeed(address,uint32)` — `(uptimeFeed, gracePeriod)` |
 
 Median sources (target `$MEDIAN`):
 
@@ -159,6 +173,19 @@ Median sources (target `$MEDIAN`):
 |---|---|
 | Set the sources for a flavor | `setSources(address,address[],uint32,uint32)` — `(token, [provider1,provider2], minFresh, maxSpreadBps)` |
 | Remove a flavor's sources | `removeSources(address)` — `(token)` |
+
+At most **5** sources per flavor (`MAX_SOURCES`, lowered from 7): every source is a feed read multiplied
+by every listed collateral on the engine's redemption path, so the cap is a direct multiplier on redeem
+gas. A 3-of-5 quorum still fits. Two further points are policy, not code:
+
+- **Sources must be genuinely independent.** Nothing on-chain stops `setSources` from pointing several
+  providers at the *same* aggregator, which produces a median with a real quorum of one and would fail
+  silently. Verify the resolved aggregators differ (`cast call $PROVIDERn "feeds(address)" $TOKEN`)
+  before queueing, and monitor it after.
+- **On any L2, set the sequencer gate.** After a sequencer outage the first blocks back replay a burst
+  of feed updates carrying *fresh* timestamps, so `maxStaleness` alone accepts prices that reflect a
+  market which moved without them. Reference: the network's canonical uptime feed, 1h grace. Leave it
+  unset (`address(0)`) on mainnet.
 
 ```bash
 # provider 1 -> Chainlink feed for TOKEN: 1h staleness, sane band [$0.90, $1.10]
@@ -178,6 +205,11 @@ DATA=$(cast calldata "setSources(address,address[],uint32,uint32)" \
 | Set the redemption margin + split | `setRedeemMargin(uint16,uint16)` — `(totalBps, toRecipientBps)` | total `<= 5`, routed `<= total` |
 | Set the margin recipient | `setMarginRecipient(address)` — `(recipient)` | `address(0)` = keep the routed part pooled |
 | Set the stale-price fallback | `setStalePriceParams(uint32,uint16)` — `(graceSeconds, haircutBps)` | grace `<= 1 day`, haircut `<= 10000`; grace `0` disables |
+
+The distress thresholds (`DISTRESS_ENTER_RATIO_BPS` 99%, `DISTRESS_EXIT_RATIO_BPS` 100.25%,
+`DISTRESS_RECOVERY_DELAY` 6h) are **constants, not parameters** — governance cannot move the anti-run
+gate in either direction. Read the live state with `distressed()`, `recoveryStartedAt()`,
+`distressClearsAt()`, and `distressParams()`.
 
 ### Guardian & token roles (target `$ENGINE` / `$TOKEN`)
 
@@ -201,13 +233,24 @@ slow timelocked path above.
 
 ### Keeper action — permissionless (anyone)
 
-`refreshPrices()` / `refreshPrice(address)` on `$ENGINE` warm the stale-price cache. Run these from any
-address (a keeper bot), no Safe or timelock needed.
+`refreshPrices()` / `refreshPrice(address)` on `$ENGINE` warm the stale-price cache.
+`pokeDistress()` on `$ENGINE` syncs the distress latch: it is what starts and advances the recovery
+countdown when the system is otherwise idle, so run it on a schedule while backing is anywhere near the
+99% line. Run all of these from any address (a keeper bot), no Safe or timelock needed.
 
 ### Terminal — freeze governance forever (target `$TIMELOCK`)
 
-`renounceExecutor()` on the timelock, once executed, makes all further changes impossible. There is no
-undo. Only do this deliberately, against a verified-good configuration.
+Renouncing the executor makes all further changes impossible, **including re-pointing a deprecated
+price feed** — which is the part of the system most likely to need maintenance. There is no undo. It is
+deliberately two-step:
+
+1. `initiateRenounce()` from the gov Safe (`gov direct initiate-renounce`) starts a publicly-visible
+   countdown of one full `DELAY`.
+2. `abortRenounce()` cancels it at any point during that window.
+3. `renounceExecutor()` after the countdown completes it.
+
+Only do this deliberately, against a verified-good configuration, and only if you accept that the oracle
+layer can never be reconfigured again.
 
 ---
 
@@ -219,7 +262,8 @@ undo. Only do this deliberately, against a verified-good configuration.
 2. Queue `PROVIDER1.setFeed(token, agg1, staleness, min, max)` and `PROVIDER2.setFeed(token, agg2, ...)`.
 3. Queue `MEDIAN.setSources(token, [PROVIDER1, PROVIDER2], minFresh, maxSpreadBps)`.
 4. Queue `ENGINE.setCollateral(token, true, redeemRateBps, MEDIAN)`.
-5. Wait 96h; execute all four. (They can share the wait — queue them together, execute together.)
+5. Wait 96h; execute all four, **within the 14-day grace window** (they can share the wait — queue them
+   together, execute together). Past `eta + GRACE_PERIOD` they expire and must be re-queued.
 6. Verify: `cast call $MEDIAN "getPriceWad(address)(uint256)" $token` returns ~`1e18`, and
    `cast call $ENGINE "collateralValueUsd(address)(uint256)" $token` reads sanely (0 until deposits).
 
@@ -242,15 +286,32 @@ If an issuer permanently blacklists the engine so a flavor's balance is stuck:
 
 1. (Optional, immediate) guardian Safe freezes it to stop new exposure.
 2. Queue + execute `ENGINE.setCollateralBackingExcluded(token, true)`. This drops its value from
-   backing and the tilt, so the ratio reflects only redeemable value. If that pushes backing below 99%,
-   distress engages and holders exit fairly via `redeemMix` (the stuck slice stays pooled, shared
-   equally). `rawCollateralValueUsd(token)` still shows the stranded value.
+   backing and the tilt, so the ratio reflects only redeemable value, and it also makes the flavor
+   **undepositable** (minting 1:1 against zero backing would dilute every holder). If that pushes
+   backing below 99%, distress engages and holders exit fairly via `redeemMix` (the stuck slice stays
+   pooled, shared equally). `rawCollateralValueUsd(token)` still shows the stranded value.
+   Note that clearing distress afterwards needs a real recapitalization: backing must hold at/above
+   100.25% for 6h (`donate` is the tool), and `pokeDistress()` advances the countdown.
 3. If the blacklist ever lifts: queue + execute `setCollateralBackingExcluded(token, false)` to
    re-include it.
 
+### Recover from distress
+
+1. Confirm the latch: `cast call $ENGINE "distressed()(bool)"`. While set, single-flavor `redeem` and
+   `redeemBatch` revert `UseRedeemMix`; holders exit pro-rata via `redeemMix`, which stays open
+   throughout and needs no oracle.
+2. Fix the cause: oracle recovery, or `donate(collateral, amount)` from anyone (permissionless, mints no
+   SumUSD, purely additive to backing).
+3. Backing must reach **100.25%**, not just 99%. The gap is deliberate: a par redemption at a rate equal
+   to the current ratio is ratio-neutral, so re-crossing a bare 99% line once would unlock an unlimited
+   cherry-picking drain that never re-trips the gate.
+4. Call `pokeDistress()` (anyone) to start the countdown, then again after 6h to clear the latch. Any
+   reading below 100.25% in between restarts the clock. `distressClearsAt()` publishes the target time.
+
 ### Rotate governance signers
 
-Signer changes happen **inside the Safe**, not on the timelock (the executor address is immutable).
+Signer changes happen **inside the Safe**, not on the timelock (both the executor and the canceller
+addresses are immutable).
 From the governance Safe: `addOwnerWithThreshold(newOwner, newThreshold)`, `removeOwner(...)`, or
 `changeThreshold(...)`. This is how a 1-of-1 launch Safe becomes, say, 3-of-5 without any protocol
 migration.

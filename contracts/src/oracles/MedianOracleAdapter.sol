@@ -24,7 +24,11 @@ contract MedianOracleAdapter is IPriceOracle, Ownable2Step {
     ///         and O(n^2) sort in {getPriceWad} — which runs inside the engine's basket-wide loops on
     ///         every deposit/redeem — so governance can never configure a source array large enough to
     ///         make pricing prohibitively expensive. Mirrors the engine's `MAX_COLLATERALS` rail.
-    uint256 internal constant MAX_SOURCES = 7;
+    /// @dev 5, not 7: every source here is a feed read multiplied by every listed collateral on the
+    ///      engine's hot path, so the cap is a direct multiplier on redemption gas. 5 still allows a
+    ///      3-of-5 quorum with two spare providers, which is the practical ceiling for independent
+    ///      USD-stablecoin feeds anyway.
+    uint256 internal constant MAX_SOURCES = 5;
 
     /// @notice Per-collateral aggregation configuration.
     struct Sources {
