@@ -293,6 +293,10 @@ The weight-tilted haircut is off until `setTiltSlopeBps(>0)` is called.
 - Single test: `forge test --match-test test_Redeem_AppliesHaircut -vvv`
 - Single contract: `forge test --match-contract SumUSDEngineTest`
 - Gas report: `forge test --gas-report`
+- Static analysis: `slither . --config-file slither.config.json --fail-high` (CI gate is High; Mediums go to the Security tab as SARIF)
+- Symbolic properties: `halmos` (config `halmos.toml`; suites in `test/halmos/*.t.sol`, functions prefixed `check_`, ignored by `forge test`). Add a `check_` property when you add an immutable rail or a pricing bound. Size-dependent tilt-pricing properties time out in every solver (256-bit division chains); they live in `SumUSDEngineHalmosDeep`, excluded from CI, run by hand.
+- Mythril: `myth analyze src/<Contract>.sol --solc-json mythril.solc.json --solv 0.8.34` (CI runs it per contract in Docker, blocks on High only)
+- CI: `.github/workflows/ci.yml` runs fmt/build/test + the three analyzers on push to `main` and on PRs. Tool versions are pinned in the workflow `env`; bump deliberately.
 - Format: `forge fmt`
 - Deploy (core only): `forge script script/Deploy.s.sol:Deploy --rpc-url $RPC_URL --private-key $PRIVATE_KEY --broadcast`
 - Testnet bringup: `forge script script/SetupSepolia.s.sol:SetupSepolia --rpc-url $SEPOLIA_RPC_URL --private-key $PRIVATE_KEY --broadcast` — deploys the protocol plus mock collateral + a settable oracle, lists every flavor, faucets the deployer, and prints a ready-to-paste frontend env block. Testnet only (mocks are unaudited and anyone can mint/reprice them).

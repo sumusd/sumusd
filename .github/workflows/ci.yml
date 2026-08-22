@@ -1,0 +1,144 @@
+name: CI
+
+# Contracts CI: build + tests, then three independent analyzers over contracts/src.
+#   slither  static analysis; blocks on High, everything else lands in the Security tab (SARIF).
+#   mythril  symbolic execution per contract; blocks on High, Medium/Low are printed for review.
+#   halmos   symbolic tests (test/halmos/*.t.sol, `check_*`); every property must be proven, no "unknown".
+# Tool versions are pinned below; bump them deliberately (a new detector can turn a green main red).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FOUNDRY_VERSION: v1.7.1
+  HALMOS_VERSION: "0.3.3"
+  MYTHRIL_IMAGE: mythril/myth:0.24.8
+  SOLC_VERSION: "0.8.34"
+
+defaults:
+  run:
+    working-directory: contracts
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  forge:
+    name: forge build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Format check
+        run: forge fmt --check
+      - name: Build
+        run: forge build --sizes
+      - name: Test
+        run: forge test
+
+  slither:
+    name: slither
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run slither
+        id: slither
+        uses: crytic/slither-action@v0.4.2
+        with:
+          target: contracts
+          slither-config: contracts/slither.config.json
+          fail-on: high
+          sarif: results.sarif
+      - name: Upload SARIF (Security tab)
+        if: always() && steps.slither.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+
+  mythril:
+    name: mythril (${{ matrix.contract }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        contract:
+          - src/SumUSD.sol
+          - src/SumUSDEngine.sol
+          - src/ImmutableTimelock.sol
+          - src/oracles/ChainlinkOracleAdapter.sol
+          - src/oracles/MedianOracleAdapter.sol
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch solc ${{ env.SOLC_VERSION }}
+        # The image's py-solc-x downloads from solc-bin.ethereum.org, which no longer resolves. Fetch the
+        # pinned compiler from binaries.soliditylang.org and mount it where py-solc-x looks (SOLCX_BINARY_PATH),
+        # so no download is attempted inside the container.
+        run: |
+          mkdir -p "$RUNNER_TEMP/solcx"
+          file="$(curl -fsSL https://binaries.soliditylang.org/linux-amd64/list.json | jq -r '.releases["${{ env.SOLC_VERSION }}"]')"
+          test -n "$file" && test "$file" != "null"
+          curl -fsSL -o "$RUNNER_TEMP/solcx/solc-v${{ env.SOLC_VERSION }}" "https://binaries.soliditylang.org/linux-amd64/$file"
+          chmod +x "$RUNNER_TEMP/solcx/solc-v${{ env.SOLC_VERSION }}"
+          "$RUNNER_TEMP/solcx/solc-v${{ env.SOLC_VERSION }}" --version
+      - name: Analyze
+        # Mythril exits 1 whenever it reports anything, so the gate is applied on its JSON instead:
+        # only High severity fails the job. The full report is printed for the PR reviewer.
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            -v "$RUNNER_TEMP/solcx":/solcx:ro -e SOLCX_BINARY_PATH=/solcx \
+            ${{ env.MYTHRIL_IMAGE }} \
+            analyze ${{ matrix.contract }} \
+            --solc-json mythril.solc.json --solv ${{ env.SOLC_VERSION }} \
+            --execution-timeout 1200 --solver-timeout 60000 --max-depth 64 \
+            --parallel-solving -o jsonv2 > mythril.json || true
+          echo "== report =="
+          jq -r '.[].issues[]? | "[\(.severity)] \(.swcID) \(.swcTitle) @ \(.locations[0].sourceMap // "?")\n  \(.description.head)"' mythril.json
+          if jq -e '.[].issues[]? | select(.severity == "High")' mythril.json > /dev/null; then
+            echo "::error::Mythril reported a High severity issue in ${{ matrix.contract }}"
+            exit 1
+          fi
+          # An analysis failure (solc download, compile error) is NOT an empty issue list: mythril reports it
+          # in meta.logs with issues=[] and exit 0, so check for it explicitly or a broken run reads as clean.
+          if jq -e '.[].meta.logs[]? | select(.level == "error")' mythril.json > /dev/null; then
+            echo "::error::Mythril failed to analyze ${{ matrix.contract }}"
+            jq -r '.[].meta.logs[]? | select(.level == "error") | .msg' mythril.json | tail -20
+            exit 1
+          fi
+          if ! jq -e 'length > 0' mythril.json > /dev/null; then
+            echo "::error::Mythril produced no report for ${{ matrix.contract }}"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: mythril-${{ strategy.job-index }}
+          path: contracts/mythril.json
+
+  halmos:
+    name: halmos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install halmos
+        run: pip install "halmos==${{ env.HALMOS_VERSION }}"
+      - name: Prove properties
+        # Config (contracts filter, loop bound, solver timeouts) lives in contracts/halmos.toml.
+        run: halmos --statistics
