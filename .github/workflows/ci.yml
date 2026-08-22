@@ -51,6 +51,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read # upload-sarif reads the workflow run; required on private repos
     steps:
       - uses: actions/checkout@v6
       - name: Run slither
@@ -62,10 +63,17 @@ jobs:
           fail-on: high
           sarif: results.sarif
       - name: Upload SARIF (Security tab)
+        # Needs code scanning on the repo (free on public repos, GitHub Advanced Security on private ones).
+        # The artifact below keeps the full report reachable either way.
         if: always() && steps.slither.outputs.sarif != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
+      - uses: actions/upload-artifact@v6
+        if: always() && steps.slither.outputs.sarif != ''
+        with:
+          name: slither-sarif
+          path: ${{ steps.slither.outputs.sarif }}
 
   mythril:
     name: mythril (${{ matrix.contract }})
