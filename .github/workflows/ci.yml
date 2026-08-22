@@ -64,8 +64,10 @@ jobs:
           sarif: results.sarif
       - name: Upload SARIF (Security tab)
         # Needs code scanning on the repo (free on public repos, GitHub Advanced Security on private ones).
-        # The artifact below keeps the full report reachable either way.
+        # Non-fatal: the gate is the slither step above, and the artifact below keeps the full report
+        # reachable either way. A failure here means the Security tab is not updated, nothing more.
         if: always() && steps.slither.outputs.sarif != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
