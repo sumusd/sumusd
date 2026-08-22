@@ -1,0 +1,13 @@
+# Halmos (symbolic testing) configuration. Picked up automatically when halmos runs from contracts/.
+# Properties live in test/halmos/*.t.sol as `check_*` functions; `forge test` ignores them.
+[global]
+# Only the CI property suites (`*Halmos`). Foundry tests are not meaningful under halmos, and `*HalmosDeep`
+# holds properties the solvers cannot yet close (see SumUSDEngine.halmos.t.sol); run those by hand.
+match-contract = "Halmos$"
+# Every loop in the engine iterates the concrete collateral list (3 flavors in the halmos setUp), so a
+# bound of 4 unrolls them fully. Bumping the list in setUp means bumping this.
+loop = 4
+# The engine's tilt math divides by symbolic sizes; give the solver room rather than report "unknown".
+solver-timeout-assertion = 120000
+solver-timeout-branching = 1000
+solver-threads = 4

@@ -45,7 +45,8 @@ for a contributor-oriented map of the code and conventions.
 contracts/        Foundry project — the protocol
   src/            SumUSD.sol, SumUSDEngine.sol, ImmutableTimelock.sol, oracles/, interfaces/
   script/         Deploy + testnet/local bring-up scripts
-  test/           Foundry test suite
+  test/           Foundry test suite (test/halmos/ holds the symbolic halmos properties)
+.github/          CI: forge build/test, slither, mythril, halmos on every push and PR
 WHITEPAPER.md     Protocol specification
 GOVERNANCE.md     Signer runbook (timelock queue/execute, per-op calldata, checklists)
 governance/       Safe multisig tooling (Safe SDK + Transaction Service API; deploy/propose/confirm/execute)
@@ -62,6 +63,16 @@ cd contracts
 forge build         # compile
 forge test          # run the test suite
 forge fmt           # format
+```
+
+CI runs the suite plus three analyzers on every push and PR (`.github/workflows/ci.yml`). To run them
+locally (Python 3.12 for the two Python tools; Docker for mythril is the CI path):
+
+```bash
+cd contracts
+slither . --config-file slither.config.json --fail-high      # static analysis (CI blocks on High)
+halmos                                                        # prove test/halmos/*.t.sol check_* properties
+myth analyze src/SumUSDEngine.sol --solc-json mythril.solc.json --solv 0.8.34   # symbolic execution, one contract
 ```
 
 Deploy the core (token + engine + timelock, wired and ownership handed to the timelock):
