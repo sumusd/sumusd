@@ -37,4 +37,15 @@ contract SumUSDHalmos is Test {
         assertFalse(ok);
         assertEq(sumUsd.balanceOf(holder), 1_000e18);
     }
+
+    /// @dev Mint authority cannot be self-granted: nobody but the admin can hand out MINTER_ROLE, to
+    ///      anyone — the escalation path from "any address" to "can mint" does not exist.
+    function check_grantMinterRole_requiresAdmin(address caller, address to) public {
+        vm.assume(caller != admin);
+        bytes32 minterRole = sumUsd.MINTER_ROLE();
+        vm.prank(caller);
+        (bool ok,) = address(sumUsd).call(abi.encodeCall(sumUsd.grantRole, (minterRole, to)));
+        assertFalse(ok);
+        if (to != minter) assertFalse(sumUsd.hasRole(minterRole, to));
+    }
 }

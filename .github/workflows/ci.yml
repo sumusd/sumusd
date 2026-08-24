@@ -89,6 +89,13 @@ jobs:
           - src/ImmutableTimelock.sol
           - src/oracles/ChainlinkOracleAdapter.sol
           - src/oracles/MedianOracleAdapter.sol
+        include:
+          # Peak memory grows with the number of explored states, and SumUSDEngine is 3x the size of
+          # anything else in the matrix: at the full 1200s its exploration outgrows the runner's memory
+          # and the OOM killer SIGKILLs mythril (exit 137, no stdout, no stderr, empty report). Bound the
+          # state space instead. If the analyze step ever reports oom-killed=true again, ratchet this down.
+          - contract: src/SumUSDEngine.sol
+            execution_timeout: 600
     steps:
       - uses: actions/checkout@v6
       - name: Fetch solc ${{ env.SOLC_VERSION }}
@@ -105,16 +112,26 @@ jobs:
       - name: Analyze
         # Mythril exits 1 whenever it reports anything, so the gate is applied on its JSON instead:
         # only High severity fails the job. The full report is printed for the PR reviewer.
+        # The exit code is captured (not ||-true'd away) and the container is kept for an OOMKilled
+        # inspect: a SIGKILLed analysis produces NOTHING (no stdout, no stderr, empty report), so without
+        # these two the job dies as an unexplained "produced no report". --parallel-solving is dropped:
+        # it forks the process at peak memory for little gain on the runner's 2 cores.
         run: |
-          docker run --rm -v "$PWD":/src -w /src \
+          set +e
+          docker run --name mythril -v "$PWD":/src -w /src \
             -v "$RUNNER_TEMP/solcx":/solcx:ro -e SOLCX_BINARY_PATH=/solcx \
             ${{ env.MYTHRIL_IMAGE }} \
             analyze ${{ matrix.contract }} \
             --solc-json mythril.solc.json --solv ${{ env.SOLC_VERSION }} \
-            --execution-timeout 1200 --solver-timeout 60000 --max-depth 64 \
-            --parallel-solving -o jsonv2 > mythril.json || true
+            --execution-timeout ${{ matrix.execution_timeout || 1200 }} --solver-timeout 60000 --max-depth 64 \
+            -o jsonv2 > mythril.json
+          rc=$?
+          oom=$(docker inspect mythril --format '{{.State.OOMKilled}}' 2>/dev/null || echo unknown)
+          docker rm mythril > /dev/null 2>&1
+          set -e
+          echo "docker exit=$rc oom-killed=$oom"
           echo "== report =="
-          jq -r '.[].issues[]? | "[\(.severity)] \(.swcID) \(.swcTitle) @ \(.locations[0].sourceMap // "?")\n  \(.description.head)"' mythril.json
+          jq -r '.[].issues[]? | "[\(.severity)] \(.swcID) \(.swcTitle) @ \(.locations[0].sourceMap // "?")\n  \(.description.head)"' mythril.json || true
           if jq -e '.[].issues[]? | select(.severity == "High")' mythril.json > /dev/null; then
             echo "::error::Mythril reported a High severity issue in ${{ matrix.contract }}"
             exit 1
@@ -127,7 +144,7 @@ jobs:
             exit 1
           fi
           if ! jq -e 'length > 0' mythril.json > /dev/null; then
-            echo "::error::Mythril produced no report for ${{ matrix.contract }}"
+            echo "::error::Mythril produced no report for ${{ matrix.contract }} (docker exit $rc, oom-killed=$oom; 137 = SIGKILLed, usually the runner's OOM killer)"
             exit 1
           fi
       - uses: actions/upload-artifact@v6
