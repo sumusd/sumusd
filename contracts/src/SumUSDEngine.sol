@@ -150,6 +150,15 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         governance can never let a collateral be valued at a price older than this.
     uint256 internal constant MAX_STALE_PRICE_GRACE = 1 days;
 
+    /// @notice Gas handed to a collateral's `transfer` inside the non-reverting {_tryTransfer} (the
+    ///         {redeemMix} skip path). A plain ERC-20 transfer costs ~50-65k; hooked or proxied tokens
+    ///         somewhat more. Without a cap a listed token turned hostile could burn 63/64 of the
+    ///         redeemer's gas on its leg (EIP-150) and two such tokens would brick the pro-rata exit.
+    uint256 internal constant TRANSFER_GAS_STIPEND = 250_000;
+    /// @notice Gas handed to a collateral's `balanceOf` inside {_tryBalanceOf}, which every basket-wide
+    ///         loop calls once per listed flavor. A view read through a proxy costs well under 20k.
+    uint256 internal constant BALANCE_GAS_STIPEND = 60_000;
+
     /// @notice Per-collateral risk parameters and pricing.
     struct CollateralConfig {
         bool enabled; // whether deposits/redemptions are allowed
@@ -591,28 +600,49 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit RedeemedMix(msg.sender, sumUsdAmount, amounts);
     }
 
-    /// @dev Non-reverting ERC-20 transfer: returns false instead of reverting if the token reverts
-    ///      or returns false. Mirrors SafeERC20's success accounting (treats a no-return token as OK)
-    ///      but never bubbles a failure up — used by {redeemMix} to skip an untransferable flavor.
-    function _tryTransfer(address token, address to, uint256 amount) internal returns (bool) {
-        (bool success, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        if (!success) return false;
-        if (ret.length == 0) return true; // no-return tokens (e.g. USDT) — the call itself succeeded
-        return ret.length >= 32 && abi.decode(ret, (bool));
+    /// @dev Non-reverting ERC-20 transfer: returns false instead of reverting if the token reverts,
+    ///      runs out of its gas stipend, or returns false. Mirrors SafeERC20's success accounting (a
+    ///      no-return token is OK, a returned word is OK iff non-zero) but never bubbles a failure up —
+    ///      used by {redeemMix} to skip an untransferable flavor. Two bounds keep one hostile flavor from
+    ///      taxing the rest of the exit: the callee gets at most {TRANSFER_GAS_STIPEND}, and only the first
+    ///      32 bytes of its return data are ever copied, so neither a gas bomb nor a return-data bomb can
+    ///      charge the caller's frame. Written in assembly for exactly that second reason: a
+    ///      `(bool, bytes memory)` call copies the ENTIRE return data into memory at the caller's expense.
+    function _tryTransfer(address token, address to, uint256 amount) internal returns (bool ok) {
+        bytes memory data = abi.encodeCall(IERC20.transfer, (to, amount));
+        uint256 stipend = TRANSFER_GAS_STIPEND;
+        // slither-disable-next-line assembly
+        assembly ("memory-safe") {
+            // Scratch space [0x00, 0x20) receives at most one word of return data.
+            let success := call(stipend, token, 0, add(data, 0x20), mload(data), 0x00, 0x20)
+            switch success
+            case 0 { ok := 0 }
+            default {
+                switch returndatasize()
+                case 0 { ok := 1 } // no-return token: the call itself succeeded
+                default { ok := and(gt(returndatasize(), 31), iszero(iszero(mload(0x00)))) }
+            }
+        }
     }
 
-    /// @dev Non-reverting `balanceOf(this)`: `(0, false)` if the token reverts, has no code, or returns
-    ///      malformed data. The listing probe checks `balanceOf` once, but an upgradeable token can break
-    ///      AFTER listing; without this, one bricked flavor would revert every basket-wide loop (all
-    ///      deposits, redemptions and views) and the pro-rata distress exit itself. Used wherever the engine
+    /// @dev Non-reverting `balanceOf(this)`: `(0, false)` if the token reverts, exhausts its gas stipend,
+    ///      has no code, or returns malformed data. The listing probe checks `balanceOf` once, but an
+    ///      upgradeable token can break AFTER listing; without this, one bricked flavor would revert every
+    ///      basket-wide loop (all deposits, redemptions and views) and the pro-rata distress exit itself.
+    ///      Bounded the same way as {_tryTransfer} ({BALANCE_GAS_STIPEND}, one word of return data), since
+    ///      this runs once per listed flavor on EVERY call that walks the basket. Used wherever the engine
     ///      walks the whole basket; the single-flavor paths still read directly (only that flavor fails).
-    function _tryBalanceOf(address token) internal view returns (uint256 balance, bool ok) {
-        // The raw staticcall IS the point (a typed call reverts on a bricked token), and the loop it runs in
-        // is bounded by MAX_COLLATERALS; same pattern as `_tryTransfer` / `_tryPriceWad`.
-        // slither-disable-next-line calls-loop,low-level-calls
-        (bool success, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
-        if (!success || ret.length < 32) return (0, false);
-        return (abi.decode(ret, (uint256)), true);
+    function _tryBalanceOf(address token) internal view returns (uint256 poolBalance, bool ok) {
+        bytes memory data = abi.encodeCall(IERC20.balanceOf, (address(this)));
+        uint256 stipend = BALANCE_GAS_STIPEND;
+        // slither-disable-next-line assembly
+        assembly ("memory-safe") {
+            let success := staticcall(stipend, token, add(data, 0x20), mload(data), 0x00, 0x20)
+            if and(success, gt(returndatasize(), 31)) {
+                poolBalance := mload(0x00)
+                ok := 1
+            }
+        }
     }
 
     /// @notice Donate `amount` of a listed `collateral` to the pool as permanent backing, minting NO

@@ -10,6 +10,7 @@ import {MockOracle} from "./mocks/MockOracle.sol";
 import {BlacklistMockERC20} from "./mocks/BlacklistMockERC20.sol";
 import {RevertingBalanceMock} from "./mocks/RevertingBalanceMock.sol";
 import {ToggleBalanceMockERC20} from "./mocks/ToggleBalanceMockERC20.sol";
+import {BombMockERC20} from "./mocks/BombMockERC20.sol";
 
 contract SumUSDEngineTest is Test {
     uint256 internal constant WAD = 1e18;
@@ -1191,5 +1192,81 @@ contract SumUSDEngineTest is Test {
         engine.pokeDistress();
         assertFalse(engine.distressed());
         assertEq(_deposit(bob, flavorA, 10e6), 10e18, "minting resumes after recovery");
+    }
+
+    // --- a hostile flavor: gas bombs and return-data bombs -----------------------------------------------
+    // The non-reverting helpers used to forward ALL remaining gas (EIP-150: 63/64 of it) and copy the
+    // entire return data into memory. A listed token turned hostile could therefore burn 63/64 of every
+    // caller's gas (a 64x tax on every basket loop, and two such tokens brick the pro-rata exit outright),
+    // or return megabytes so the CALLER paid quadratic memory expansion. Both are now bounded per call.
+
+    MockERC20 internal flavorE; // listed AFTER the bomb, so every loop has a leg on each side of it
+
+    function _seedWithBomb() internal returns (BombMockERC20 bomb) {
+        bomb = new BombMockERC20("Bomb", "BOMB", 6);
+        flavorE = new MockERC20("Flavor E", "FLAV-E", 6);
+        oracle.setPrice(address(bomb), WAD);
+        oracle.setPrice(address(flavorE), WAD);
+        vm.startPrank(owner);
+        engine.setCollateral(address(bomb), true, uint16(BPS), oracle); // index 3
+        engine.setCollateral(address(flavorE), true, uint16(BPS), oracle); // index 4
+        vm.stopPrank();
+        bomb.mint(alice, 1_000e6);
+        vm.startPrank(alice);
+        bomb.approve(address(engine), 1_000e6);
+        engine.deposit(address(bomb), 1_000e6, 0);
+        vm.stopPrank();
+        _deposit(alice, flavorA, 1_000e6);
+        _deposit(alice, flavorB, 1_000e6);
+        _deposit(alice, flavorC, 1_000e18);
+        _deposit(alice, flavorE, 1_000e6); // 5,000 SumUSD against $5,000
+    }
+
+    function test_GasBomb_BalanceOf_BoundedInEveryBasketLoop() public {
+        BombMockERC20 bomb = _seedWithBomb();
+        bomb.arm(false, true, false, false);
+        // The bomb reads as unreadable (0) and every basket loop still completes within an ordinary budget.
+        uint256 g = gasleft();
+        uint256 ratio = engine.systemCollateralizationRatioBps();
+        uint256 used = g - gasleft();
+        assertEq(ratio, 8000, "hostile flavor values at 0 (conservative), the rest is honest");
+        assertLt(used, 400_000, "a gas-bomb balanceOf cannot tax the basket snapshot beyond its stipend");
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+        // Deposit / redeemMix keep working with a normal gas limit (the exit is the one that must never brick).
+        vm.prank(alice);
+        uint256[] memory outs = engine.redeemMix{gas: 1_500_000}(100e18, new uint256[](0));
+        assertEq(outs[0], 20e6, "A slice paid");
+        assertEq(outs[3], 0, "bomb slice skipped (its balance is unreadable)");
+        assertEq(outs[4], 20e6, "leg after the bomb still paid");
+    }
+
+    function test_GasBomb_Transfer_CannotBrickRedeemMix() public {
+        BombMockERC20 bomb = _seedWithBomb();
+        oracle.setPrice(address(flavorC), 0.5e18); // real shortfall: latch
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+        bomb.arm(true, false, false, false); // transfer burns everything it is given
+        vm.prank(alice);
+        uint256[] memory outs = engine.redeemMix{gas: 1_500_000}(100e18, new uint256[](0));
+        assertEq(outs[0], 20e6, "leg before the bomb paid");
+        assertEq(outs[3], 0, "bomb leg skipped, not reverted, and it did not eat the budget");
+        assertEq(outs[4], 20e6, "leg after the bomb still paid");
+        assertEq(flavorE.balanceOf(alice), 20e6);
+    }
+
+    function test_DataBomb_BalanceOfAndTransfer_CallerPaysNothingExtra() public {
+        BombMockERC20 bomb = _seedWithBomb();
+        bomb.arm(false, false, true, true);
+        uint256 g = gasleft();
+        engine.systemCollateralizationRatioBps();
+        assertLt(g - gasleft(), 400_000, "megabytes of return data are never copied into the caller");
+        engine.pokeDistress(); // bomb reads 0 -> 80% -> latched
+        bomb.arm(false, false, true, false); // balance readable again; only the transfer bombs
+        vm.prank(alice);
+        uint256[] memory outs = engine.redeemMix{gas: 1_500_000}(100e18, new uint256[](0));
+        assertEq(outs[0], 20e6);
+        assertEq(outs[3], 0, "data-bombing transfer is treated as failed and skipped");
+        assertEq(outs[4], 20e6, "leg after the bomb still paid");
     }
 }
