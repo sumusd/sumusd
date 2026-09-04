@@ -254,7 +254,12 @@ if systemCollateralizationRatioBps() < MIN_MINT_RATIO_BPS  ⇒ revert
 ```
 
 This prevents new issuance into an under-backed pool — a fresh depositor cannot mint SumUSD
-that would immediately socialize an existing shortfall. The threshold sits at 99% rather than
+that would immediately socialize an existing shortfall. Independently of the ratio, a deposit also
+reverts (`MintDisabledInDistress`) for as long as the distress latch is set (§5.4), including the
+recovery window in which backing may already read above par: the latched regime is exit-only, its exit
+is the haircut-free pro-rata `redeemMix`, and a par-minted deposit taken straight back out through it
+would be the peg-band arbitrage of §4.1 with nothing left to bound it. Recapitalization during distress
+is `donate` (§5.4), not minting. The threshold sits at 99% rather than
 100% precisely because the basket structurally trades a hair under par: a hard 100% guard,
 combined with raw 1:1 minting, would pause issuance during entirely normal market conditions.
 The 1% of slack absorbs ordinary sub-par trading while still halting issuance during a real
@@ -403,11 +408,23 @@ properties make it run-proof:
   pool at the same ratios; a later redeemer gets exactly the same slice of the original basket they
   would have gotten first. There is no advantage to redeeming earlier.
 - **Ratio-invariance.** Pro-rata removes value and burns supply in the same proportion, so the
-  backing ratio stays flat as holders exit — versus single-flavor par redemption, which *lowers*
-  the ratio for everyone remaining (the mechanism that drives the run).
+  backing ratio stays flat as holders exit (and rises, once the par cap binds above 100%) — versus
+  an uncapped single-flavor par redemption, which *lowers* the ratio for everyone remaining (the
+  mechanism that drives the run).
 
-The payout is pure ownership math — **no oracle, no haircut, no tilt** — so it remains correct even
-if some price feeds are dead. Frozen collaterals are included (their value is distributed too). And
+The payout is ownership math — **no haircut, no tilt** — with a single, one-sided use of the oracle:
+**a slice is capped at par.** While backing is *above* 100% (the recovery window after a recap), every
+slice is scaled by `totalSupply / backingUsd`, so a SumUSD never exits with more than $1.00 of backing.
+The cap only ever shrinks a payout, and only when the pool holds *more* than the claim; below par the
+slices are the raw pro-rata share, and a dead feed (which can only *lower* the measured backing) can
+never shrink one. So the exit stays oracle-independent exactly where that matters — sharing a shortfall
+— and remains correct even if some price feeds are dead. Without the cap the surplus above par was fully
+extractable during every recovery window: deposit, then `redeemMix`, in one transaction, took
+`ratio − 1` per unit, lowered the ratio by exactly that, and once it slipped under the exit line the
+recovery clock reset — a loop that both skimmed the buffer and kept the system latched. With the cap the
+excess stays pooled, so every pro-rata exit *raises* backing and shortens recovery (and minting is closed
+while latched, §4.3, which removes the loop's other half). Frozen collaterals are included (their value
+is distributed too). And
 a flavor whose transfer *fails* — for instance a custodial issuer that has blacklisted the engine
 address — is **skipped rather than reverted**, so a single non-transferable collateral cannot block
 the whole pro-rata exit; its slice simply stays pooled. Above 99% backing, `redeemMix` reverts
@@ -609,7 +626,8 @@ is load-bearing: it gates minting (§4.3) and is surfaced to users and monitors.
 
 ### 6.4 Enforced invariants
 
-- **No mint when undercollateralized** below 99% (§4.3).
+- **No mint when undercollateralized** below 99%, and **no mint while the distress latch is set** at any
+  ratio (§4.3).
 - **No redemption returns more than face, in UNITS or in VALUE** — `effectiveRedeemRate ≤ 100%` by
   clamp (§5.2), and when a flavor's live price is above $1.00 the rate is additionally scaled by
   `1/price`, so a redemption never removes more than $1.00 of mark-to-market value per SumUSD burned
@@ -618,6 +636,9 @@ is load-bearing: it gates minting (§4.3) and is surfaced to users and monitors.
 - **No redemption lowers the backing ratio** — the effective rate is also capped at the current backing
   ratio (§5.8), so the value leaving per SumUSD burned never exceeds the value held per SumUSD, in any
   regime. Checked by a stateful invariant across price moves, dead feeds and the stale fallback.
+- **No exit pays more than $1.00 of backing per SumUSD, in either regime** — single-flavor via the
+  above-par clamp (§5.7), pro-rata via the `redeemMix` par cap (§5.4). The accumulated surplus is not
+  extractable through the distress exit.
 - **No single collateral can brick the basket or the distress exit** — a listed token whose `balanceOf`
   starts reverting after listing (e.g. a bricked upgradeable proxy) is read defensively wherever the engine
   walks the whole basket: it values at 0 (so distress triggers honestly), `poolNeeds` never steers deposits

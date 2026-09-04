@@ -272,4 +272,56 @@ contract AdversarialTest is Test {
         assertGe(engine.systemCollateralizationRatioBps(), ratioBefore, "a redemption never lowers backing");
         assertFalse(engine.distressed(), "and can never walk the pool into distress by itself");
     }
+
+    // -----------------------------------------------------------------
+    // WEAKNESS (fixed): the distress exit paid ABOVE par during recovery. `redeemMix` is ownership math
+    // (amount/supply of every flavor), so once a recap lifted backing over 100.25% every SumUSD exited at
+    // `ratio` dollars for the whole 6h recovery window. Minting was still open there (the mint guard is 99%
+    // and never looked at the latch), so deposit + redeemMix in one tx extracted (ratio - 1) per unit,
+    // lowered the ratio by exactly what it took, and once under 100.25% RESET the recovery clock: the
+    // surplus above par was fully extractable and the system stayed latched. Now (1) each slice is capped
+    // at par (scaled by 1/ratio when ratio > 100%; the excess stays pooled, so every exit RAISES backing and
+    // shortens recovery) and (2) no SumUSD is minted while the latch is set (recap is `donate`).
+    // -----------------------------------------------------------------
+    function test_Fix_RedeemMixCappedAtParAndNoMintWhileLatched() public {
+        engine.setCollateral(address(a), true, uint16(BPS), oracle);
+        engine.setCollateral(address(b), true, uint16(BPS), oracle);
+        address lp = makeAddr("lp");
+        _deposit(lp, a, 1_000e6);
+        _deposit(lp, b, 1_000e6);
+
+        oracle.setPrice(address(b), 0.97e18); // B wobbles: 98.5% -> latched
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+        oracle.setPrice(address(b), WAD); // B recovers
+        a.mint(address(this), 40e6);
+        a.approve(address(engine), 40e6);
+        engine.donate(address(a), 40e6); // recap to 102%: recovery clock starts
+        assertEq(engine.systemCollateralizationRatioBps(), 10_200);
+        uint256 clearsAt = engine.distressClearsAt();
+        assertGt(clearsAt, 0, "recovery countdown running");
+
+        // (2) Minting is closed while latched, even though the ratio is far above the 99% mint floor.
+        address att = makeAddr("attacker");
+        a.mint(att, 1_000e6);
+        vm.startPrank(att);
+        a.approve(address(engine), 1_000e6);
+        vm.expectPartialRevert(SumUSDEngine.MintDisabledInDistress.selector);
+        engine.deposit(address(a), 1_000e6, 0);
+        vm.stopPrank();
+
+        // (1) An existing holder exits at exactly $1 per SumUSD, not $1.02: the pro-rata slice is scaled
+        // by 1/ratio, and the preview mirrors it.
+        (, uint256[] memory quoted) = engine.previewRedeemMix(1_000e18);
+        vm.prank(lp);
+        uint256[] memory outs = engine.redeemMix(1_000e18, new uint256[](0));
+        assertEq(outs[0], quoted[0]);
+        assertEq(outs[1], quoted[1]);
+        // raw slices would be 520 A + 500 B ($1,020); capped: 520/1.02 + 500/1.02 = 509.80 + 490.19
+        uint256 paidUsd = (outs[0] + outs[1]) * 1e12;
+        assertLe(paidUsd, 1_000e18, "never more than $1 of value per SumUSD");
+        assertGt(paidUsd, 999.99e18, "and never meaningfully less than $1 while backing is above par");
+        assertGt(engine.systemCollateralizationRatioBps(), 10_200, "the excess stays pooled: backing rises");
+        assertEq(engine.distressClearsAt(), clearsAt, "recovery clock untouched");
+    }
 }

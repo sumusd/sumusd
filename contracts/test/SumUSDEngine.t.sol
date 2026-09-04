@@ -1100,4 +1100,65 @@ contract SumUSDEngineTest is Test {
         assertEq(flavorA.balanceOf(alice), 500e6);
         assertEq(sumUsd.balanceOf(alice), 1_000e18);
     }
+
+    // --- redeemMix par cap ------------------------------------------------------------------------------
+
+    function test_RedeemMix_BelowParPaysFullSliceAboveParPaysDollar() public {
+        _deposit(alice, flavorA, 1_000e6);
+        _deposit(alice, flavorB, 1_000e6);
+        oracle.setPrice(address(flavorB), 0.9e18); // 95% backed: latched, slices are NOT scaled (ratio < 100%)
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+        vm.prank(alice);
+        uint256[] memory outs = engine.redeemMix(200e18, new uint256[](0));
+        assertEq(outs[0], 100e6, "under par: full pro-rata slice of A");
+        assertEq(outs[1], 100e6, "under par: full pro-rata slice of B");
+
+        // A recap above par: slices scale by 1/ratio, minOut is checked against the SCALED amount.
+        flavorA.mint(bob, 300e6);
+        vm.startPrank(bob);
+        flavorA.approve(address(engine), 300e6);
+        engine.donate(address(flavorA), 300e6);
+        vm.stopPrank();
+        oracle.setPrice(address(flavorB), WAD);
+        // pool: 1,200 A + 900 B = $2,100 against 1,800 supply -> 116.66%
+        assertEq(engine.systemCollateralizationRatioBps(), 11_666);
+        uint256 backing = engine.totalCollateralValueUsd(); // 2,100e18
+        uint256[] memory minOut = new uint256[](3);
+        minOut[0] = (1_200e6 * 180e18 / 1_800e18) * 1_800e18 / backing; // exactly the capped slice
+        vm.prank(alice);
+        outs = engine.redeemMix(180e18, minOut);
+        assertEq(outs[0], minOut[0], "A slice scaled by supply/backing");
+        assertEq(outs[1], (900e6 * 180e18 / 1_800e18) * 1_800e18 / backing, "B slice scaled by supply/backing");
+        assertLe((outs[0] + outs[1]) * 1e12, 180e18, "<= $1 per SumUSD");
+        assertGe((outs[0] + outs[1]) * 1e12, 180e18 - 1e13, "and within rounding of $1");
+        minOut[0] += 1;
+        vm.prank(alice);
+        vm.expectPartialRevert(SumUSDEngine.SlippageExceeded.selector);
+        engine.redeemMix(180e18, minOut);
+    }
+
+    function test_Deposit_BlockedWhileLatchedEvenAboveMintFloor() public {
+        _deposit(alice, flavorA, 1_000e6);
+        oracle.setPrice(address(flavorA), 0.98e18); // 98%: latched
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+        oracle.setPrice(address(flavorA), WAD); // back to 100%: still latched (needs 100.25% held 6h)
+        flavorA.mint(bob, 10e6);
+        vm.startPrank(bob);
+        flavorA.approve(address(engine), 10e6);
+        vm.expectPartialRevert(SumUSDEngine.MintDisabledInDistress.selector);
+        engine.deposit(address(flavorA), 10e6, 0);
+        vm.stopPrank();
+        // Once the latch clears, minting resumes with no admin action.
+        flavorA.mint(bob, 3e6);
+        vm.startPrank(bob);
+        flavorA.approve(address(engine), 3e6);
+        engine.donate(address(flavorA), 3e6); // 100.3%
+        vm.stopPrank();
+        vm.warp(block.timestamp + 6 hours);
+        engine.pokeDistress();
+        assertFalse(engine.distressed());
+        assertEq(_deposit(bob, flavorA, 10e6), 10e18, "minting resumes after recovery");
+    }
 }
