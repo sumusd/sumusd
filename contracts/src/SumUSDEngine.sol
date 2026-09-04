@@ -591,6 +591,9 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///      deposits, redemptions and views) and the pro-rata distress exit itself. Used wherever the engine
     ///      walks the whole basket; the single-flavor paths still read directly (only that flavor fails).
     function _tryBalanceOf(address token) internal view returns (uint256 balance, bool ok) {
+        // The raw staticcall IS the point (a typed call reverts on a bricked token), and the loop it runs in
+        // is bounded by MAX_COLLATERALS; same pattern as `_tryTransfer` / `_tryPriceWad`.
+        // slither-disable-next-line calls-loop,low-level-calls
         (bool success, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
         if (!success || ret.length < 32) return (0, false);
         return (abi.decode(ret, (uint256)), true);
