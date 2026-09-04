@@ -150,6 +150,15 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         governance can never let a collateral be valued at a price older than this.
     uint256 internal constant MAX_STALE_PRICE_GRACE = 1 days;
 
+    /// @notice Gas handed to a collateral's `transfer` inside the non-reverting {_tryTransfer} (the
+    ///         {redeemMix} skip path). A plain ERC-20 transfer costs ~50-65k; hooked or proxied tokens
+    ///         somewhat more. Without a cap a listed token turned hostile could burn 63/64 of the
+    ///         redeemer's gas on its leg (EIP-150) and two such tokens would brick the pro-rata exit.
+    uint256 internal constant TRANSFER_GAS_STIPEND = 250_000;
+    /// @notice Gas handed to a collateral's `balanceOf` inside {_tryBalanceOf}, which every basket-wide
+    ///         loop calls once per listed flavor. A view read through a proxy costs well under 20k.
+    uint256 internal constant BALANCE_GAS_STIPEND = 60_000;
+
     /// @notice Per-collateral risk parameters and pricing.
     struct CollateralConfig {
         bool enabled; // whether deposits/redemptions are allowed
@@ -591,28 +600,49 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit RedeemedMix(msg.sender, sumUsdAmount, amounts);
     }
 
-    /// @dev Non-reverting ERC-20 transfer: returns false instead of reverting if the token reverts
-    ///      or returns false. Mirrors SafeERC20's success accounting (treats a no-return token as OK)
-    ///      but never bubbles a failure up — used by {redeemMix} to skip an untransferable flavor.
-    function _tryTransfer(address token, address to, uint256 amount) internal returns (bool) {
-        (bool success, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        if (!success) return false;
-        if (ret.length == 0) return true; // no-return tokens (e.g. USDT) — the call itself succeeded
-        return ret.length >= 32 && abi.decode(ret, (bool));
+    /// @dev Non-reverting ERC-20 transfer: returns false instead of reverting if the token reverts,
+    ///      runs out of its gas stipend, or returns false. Mirrors SafeERC20's success accounting (a
+    ///      no-return token is OK, a returned word is OK iff non-zero) but never bubbles a failure up —
+    ///      used by {redeemMix} to skip an untransferable flavor. Two bounds keep one hostile flavor from
+    ///      taxing the rest of the exit: the callee gets at most {TRANSFER_GAS_STIPEND}, and only the first
+    ///      32 bytes of its return data are ever copied, so neither a gas bomb nor a return-data bomb can
+    ///      charge the caller's frame. Written in assembly for exactly that second reason: a
+    ///      `(bool, bytes memory)` call copies the ENTIRE return data into memory at the caller's expense.
+    function _tryTransfer(address token, address to, uint256 amount) internal returns (bool ok) {
+        bytes memory data = abi.encodeCall(IERC20.transfer, (to, amount));
+        uint256 stipend = TRANSFER_GAS_STIPEND;
+        // slither-disable-next-line assembly
+        assembly ("memory-safe") {
+            // Scratch space [0x00, 0x20) receives at most one word of return data.
+            let success := call(stipend, token, 0, add(data, 0x20), mload(data), 0x00, 0x20)
+            switch success
+            case 0 { ok := 0 }
+            default {
+                switch returndatasize()
+                case 0 { ok := 1 } // no-return token: the call itself succeeded
+                default { ok := and(gt(returndatasize(), 31), iszero(iszero(mload(0x00)))) }
+            }
+        }
     }
 
-    /// @dev Non-reverting `balanceOf(this)`: `(0, false)` if the token reverts, has no code, or returns
-    ///      malformed data. The listing probe checks `balanceOf` once, but an upgradeable token can break
-    ///      AFTER listing; without this, one bricked flavor would revert every basket-wide loop (all
-    ///      deposits, redemptions and views) and the pro-rata distress exit itself. Used wherever the engine
+    /// @dev Non-reverting `balanceOf(this)`: `(0, false)` if the token reverts, exhausts its gas stipend,
+    ///      has no code, or returns malformed data. The listing probe checks `balanceOf` once, but an
+    ///      upgradeable token can break AFTER listing; without this, one bricked flavor would revert every
+    ///      basket-wide loop (all deposits, redemptions and views) and the pro-rata distress exit itself.
+    ///      Bounded the same way as {_tryTransfer} ({BALANCE_GAS_STIPEND}, one word of return data), since
+    ///      this runs once per listed flavor on EVERY call that walks the basket. Used wherever the engine
     ///      walks the whole basket; the single-flavor paths still read directly (only that flavor fails).
-    function _tryBalanceOf(address token) internal view returns (uint256 balance, bool ok) {
-        // The raw staticcall IS the point (a typed call reverts on a bricked token), and the loop it runs in
-        // is bounded by MAX_COLLATERALS; same pattern as `_tryTransfer` / `_tryPriceWad`.
-        // slither-disable-next-line calls-loop,low-level-calls
-        (bool success, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
-        if (!success || ret.length < 32) return (0, false);
-        return (abi.decode(ret, (uint256)), true);
+    function _tryBalanceOf(address token) internal view returns (uint256 poolBalance, bool ok) {
+        bytes memory data = abi.encodeCall(IERC20.balanceOf, (address(this)));
+        uint256 stipend = BALANCE_GAS_STIPEND;
+        // slither-disable-next-line assembly
+        assembly ("memory-safe") {
+            let success := staticcall(stipend, token, add(data, 0x20), mload(data), 0x00, 0x20)
+            if and(success, gt(returndatasize(), 31)) {
+                poolBalance := mload(0x00)
+                ok := 1
+            }
+        }
     }
 
     /// @notice Donate `amount` of a listed `collateral` to the pool as permanent backing, minting NO
@@ -1141,13 +1171,20 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev Price used to VALUE a collateral for backing/tilt: the live feed if it answers; otherwise,
-    ///      if the stale-price fallback is enabled and the last-good price is within the grace window,
-    ///      that price minus `stalePriceHaircutBps`; otherwise 0. Never used for the deposit peg guard
-    ///      (live-only) or the redemption payout (par). `BPS - stalePriceHaircutBps` cannot underflow —
-    ///      the setter rails `stalePriceHaircutBps <= BPS`.
+    ///      the stale fallback ({_stalePriceWad}), else 0. Never used for the deposit peg guard (live-only)
+    ///      or the par conversion of the redemption payout; the payout's above-par clamp does use it (see
+    ///      {_liveRedeemRateBps}), so the value a redemption removes is bounded by the same number the
+    ///      backing ratio counts it at.
     function _valuationPriceWad(address token, IPriceOracle oracle) internal view returns (uint256) {
         (uint256 live, bool ok) = _tryPriceWad(token, oracle);
         if (ok) return live;
+        return _stalePriceWad(token);
+    }
+
+    /// @dev The stale-price fallback on its own (no live read): the last-good price minus
+    ///      `stalePriceHaircutBps` while the fallback is enabled and the cache is within the grace window;
+    ///      0 otherwise. `BPS - stalePriceHaircutBps` cannot underflow — the setter rails the haircut.
+    function _stalePriceWad(address token) internal view returns (uint256) {
         uint256 grace = stalePriceGraceSeconds;
         if (grace == 0) return 0;
         uint256 at = lastGoodPriceAt[token];
@@ -1254,12 +1291,18 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
 
     /// @dev The live effective redemption rate for `collateral`, computed exactly as {redeem} applies
     ///      it, so a quote can never diverge from the payout. An unpriceable feed (oracle reverts or
-    ///      returns 0) falls back to the flat base rate at par (the payout never depends on the oracle);
-    ///      otherwise the weight tilt via {_redeemRateFor} (penalty-direction-only for a frozen flavor).
-    ///      Either way the rate is then capped at the backing ratio ({_capAtBacking}) and, when live-priced,
-    ///      clamped above par ({_clampAbovePar}) — in that order, so the USD value paid never exceeds the
-    ///      ratio's worth per SumUSD. `poolBalance` is the pre-redemption pool balance of `collateral` (in
-    ///      its own decimals); `ratioBps` the backing ratio from the same basket snapshot.
+    ///      returns 0) falls back to the flat base rate (no tilt: the share cannot be weighed); otherwise
+    ///      the weight tilt via {_redeemRateFor} (penalty-direction-only for a frozen flavor). Either way
+    ///      the rate is then capped at the backing ratio ({_capAtBacking}) and clamped above par
+    ///      ({_clampAbovePar}) against the price the BACKING side counts the flavor at — the live price, or
+    ///      on a dead feed the stale fallback — in that order, so the counted value paid never exceeds the
+    ///      ratio's worth per SumUSD. The dead-feed clamp is what keeps a feed outage from reopening the
+    ///      flight-to-quality drain: with the fallback on, a flavor last seen at $1.18 whose feed then died
+    ///      was VALUED at ~$1.17 but PAID at par, so every redemption of it lowered backing for the whole
+    ///      grace window. The clamp only ever trims (never blocks) and expires with the cache, after which
+    ///      the exit is exactly par: no oracle can gate the exit, and no oracle can make it optimistic.
+    ///      `poolBalance` is the pre-redemption pool balance of `collateral` (in its own decimals);
+    ///      `ratioBps` the backing ratio from the same basket snapshot.
     function _liveRedeemRateBps(
         address collateral,
         CollateralConfig memory c,
@@ -1271,7 +1314,10 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ) internal view returns (uint256) {
         if (address(c.oracle) == address(0)) return 0; // unlisted: quote 0 rather than reverting
         (uint256 priceWad, bool priced) = _tryPriceWad(collateral, c.oracle);
-        if (!priced) return _capAtBacking(c.redeemRateBps, ratioBps); // dead feed: flat base rate at par
+        if (!priced) {
+            // Dead feed: flat base rate, clamped against the stale valuation (0 once the cache expires).
+            return _clampAbovePar(_capAtBacking(c.redeemRateBps, ratioBps), _stalePriceWad(collateral));
+        }
         uint256 rate = _redeemRateFor(c, _toUsdAt(poolBalance, c, priceWad), sumUsdAmount, totalUsd, funded);
         return _clampAbovePar(_capAtBacking(rate, ratioBps), priceWad);
     }
@@ -1289,7 +1335,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         uint256 ratioBps
     ) internal returns (uint256) {
         (uint256 priceWad, bool priced) = _tryPriceWad(collateral, c.oracle);
-        if (!priced) return _capAtBacking(c.redeemRateBps, ratioBps);
+        if (!priced) return _clampAbovePar(_capAtBacking(c.redeemRateBps, ratioBps), _stalePriceWad(collateral));
         _writeLastGood(collateral, priceWad);
         uint256 rate = _redeemRateFor(c, _toUsdAt(poolBalance, c, priceWad), sumUsdAmount, totalUsd, funded);
         return _clampAbovePar(_capAtBacking(rate, ratioBps), priceWad);
@@ -1316,8 +1362,9 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///      trading above $1 be drained for more value than the SumUSD burned represents — during a flight
     ///      to quality that is a standing incentive to strip the pool of its best asset and leave the
     ///      impaired one behind, and it makes redemption LOWER the backing ratio. Scaling the rate by
-    ///      `1/price` when `price > $1` is the conservative direction only: it can never increase a payout,
-    ///      and a dead feed (`priceWad == 0`, handled by the callers) falls through to par unchanged.
+    ///      `1/price` when `price > $1` is the conservative direction only: it can never increase a payout.
+    ///      Callers pass the live price, or on a dead feed the stale valuation; an expired cache passes 0,
+    ///      which falls through to par unchanged.
     function _clampAbovePar(uint256 rateBps, uint256 priceWad) internal pure returns (uint256) {
         if (priceWad <= WAD) return rateBps;
         return (rateBps * WAD) / priceWad;

@@ -117,10 +117,9 @@ abstract contract EngineInvariantBase is Test {
     /// A redemption never hands out more than $1 of mark-to-market value per SumUSD burned. The payout is
     /// price-blind below par (a sub-$1 flavor pays par units, which is what keeps the round-trip arbitrage
     /// closed) but clamped above it, so an above-$1 flavor cannot be stripped from the pool at par.
-    /// @dev Bounded against the LIVE price only. The clamp is deliberately live-only, because a dead feed
-    ///      must fall back to a flat base rate at par so holders can always exit without the oracle. The
-    ///      residual (a flavor that spikes above $1 and then loses its feed pays par units) is the price of
-    ///      that liveness guarantee.
+    /// @dev Checked against the LIVE price here; the dead-feed case (clamped against the stale valuation, so
+    ///      the counted value paid never exceeds the counted value held) is covered by
+    ///      `invariant_singleRedeemNeverLowersRatio`, which is what caught the live-only clamp leaking.
     function invariant_neverPaysAbovePar() public view {
         address[] memory list = engine.listedCollaterals();
         for (uint256 i; i < list.length; ++i) {

@@ -181,4 +181,36 @@ contract StalePriceFallbackTest is Test {
         vm.expectRevert();
         engine.setStalePriceParams(GRACE, HAIRCUT);
     }
+
+    // WEAKNESS (fixed, found by invariant_singleRedeemNeverLowersRatio in CI): the above-par clamp was
+    // LIVE-only, but with the fallback on, a dead-feed flavor is VALUED at its last-good price minus the
+    // haircut. So a flavor last seen at $1.18 whose feed then died paid par units worth $1.17 each of
+    // counted backing per SumUSD burned: the flight-to-quality drain the clamp closed, reopened for the
+    // whole grace window by a feed outage. The dead-feed path now clamps above par with the valuation
+    // price. It still never blocks an exit (it only trims), and once the cache expires it is exactly par.
+    function test_Fix_DeadFeedRedeemClampedByStaleValuation() public {
+        engine.setStalePriceParams(GRACE, HAIRCUT);
+        _deposit(alice, a, 100_000e6); // B is ~1% of the pool, so its cache expiring never trips distress
+        address u = makeAddr("u");
+        _deposit(u, b, 1_000e6);
+        oracle.setPrice(address(b), 1.2e18); // B bid above par
+        engine.refreshPrices(); // last-good B = $1.20
+        oracle.setPrice(address(b), 0); // feed dies: B valued at 1.2 * 0.99 = $1.188 for the grace window
+        assertEq(engine.valuationPriceWad(address(b)), 1.188e18);
+        uint256 before = engine.systemCollateralizationRatioBps();
+
+        uint256 quoted = engine.previewRedeem(address(b), 100e18);
+        vm.prank(u);
+        uint256 out = engine.redeem(address(b), 100e18, 0);
+        assertEq(out, quoted, "preview == payout on the dead-feed path");
+        // base 9900 bps scaled by 1/1.188 = 8333 bps (floored): 100 SumUSD -> 83.33 units, ~$99 of counted backing.
+        assertEq(out, 83_330_000, "par units scaled down by the stale valuation");
+        assertLe((out * 1.188e18) / 1e6, 100e18, "never more than $1 of counted backing per SumUSD");
+        assertGe(engine.systemCollateralizationRatioBps(), before, "a dead-feed redemption no longer lowers backing");
+
+        // Once the cache expires the flavor values at 0 and the exit is exactly par again.
+        vm.warp(block.timestamp + 6 hours + 1);
+        assertEq(engine.valuationPriceWad(address(b)), 0);
+        assertEq(engine.previewRedeem(address(b), 100e18), 99e6, "expired cache: flat base rate at par");
+    }
 }

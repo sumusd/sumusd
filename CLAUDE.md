@@ -44,9 +44,13 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   was drained at par during a flight to quality — stripping the pool of its best asset, leaving the
   impaired one behind, and *lowering* the backing ratio (which also falsified the "redemptions only raise
   backing" premise behind `redeemBatch`'s single distress check). This is the conservative direction only
-  and does NOT re-open the mint arb, which came from valuing a *low* price *up*. A dead feed falls through
-  to par unchanged, preserving the oracle-independent exit; the residual is that a flavor which spikes
-  above $1 and then loses its feed still pays par units, which is the price of that liveness guarantee.
+  and does NOT re-open the mint arb, which came from valuing a *low* price *up*. On a DEAD feed the clamp
+  uses the stale-price fallback (`_stalePriceWad`, the same number backing counts the flavor at) and falls
+  through to par only once that cache expires. It was live-only until 2026-09-04; with the stale fallback
+  on, a flavor last seen at $1.18 whose feed then died was VALUED at ~$1.17 but PAID at par, so every
+  redemption of it lowered backing for the whole grace window (caught by
+  `invariant_singleRedeemNeverLowersRatio` in CI, regression `test_Fix_DeadFeedRedeemClampedByStaleValuation`).
+  No feed state can block the exit, only trim it.
   **Backing-ratio cap (the below-par mirror).** The effective rate is also capped at the current backing
   ratio (`_capAtBacking`, applied BEFORE the above-par clamp). Outside distress the ratio can legitimately
   sit in [99%, 100%) (in-band sub-$1 deposits, a mild depeg); a redemption paid ABOVE it (100%-base flavor,
@@ -280,11 +284,19 @@ MAX_COLLATERAL_DECIMALS` (18) — fail-fast at governance time (`InvalidCollater
 rebasing/fee-on-transfer/transfer-hook tokens (they need a live transfer or manifest over time); those
 stay a governance whitelist-policy matter (see the collateral eligibility FAQ on the website).
 
-**Bricked-token resilience:** the listing probe checks `balanceOf` once, but an upgradeable token can
-break after listing. Every basket-wide read goes through `_tryBalanceOf` (staticcall, `(0,false)` on
-revert): such a flavor values at 0 (distress triggers honestly), `poolNeeds` skips it, and
+**Hostile-token resilience:** the listing probe checks `balanceOf` once, but an upgradeable token can
+break (or turn hostile) after listing. Every basket-wide read goes through `_tryBalanceOf` (staticcall,
+`(0,false)` on revert): such a flavor values at 0 (distress triggers honestly), `poolNeeds` skips it, and
 `redeemMix`/`previewRedeemMix` treat its slice as empty — the same "one broken flavor never blocks the
 exit" promise as the `_tryTransfer` skip. Single-flavor `redeem` of it still reverts (only that flavor).
+**Both helpers are gas- and return-data-bounded** (assembly): the callee gets at most
+`TRANSFER_GAS_STIPEND` (250k) / `BALANCE_GAS_STIPEND` (60k) and only ONE word of return data is ever
+copied. Without that, a raw call forwards 63/64 of the caller's gas (EIP-150), so a gas-bomb
+`balanceOf` taxed every basket loop 64x and two gas-bomb transfers bricked the pro-rata exit; and a
+`(bool, bytes memory)` call copies the ENTIRE return data at the caller's expense (a return-data bomb).
+A legitimate token whose transfer exceeds the stipend simply takes the skip path. Mock:
+`test/mocks/BombMockERC20.sol`; tests `test_GasBomb_*` / `test_DataBomb_*`. `_tryPriceWad` (try/catch on
+the governance-owned oracle stack) is deliberately NOT bounded: the oracle is trusted infrastructure.
 
 **Oracle resilience:** `collateralValueUsd` prices a collateral via `_valuationPriceWad`: the live
 feed (`_tryPriceWad`, try/catch) if available; else, if the **stale-price fallback** is enabled, the

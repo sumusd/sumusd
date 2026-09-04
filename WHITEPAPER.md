@@ -427,7 +427,11 @@ while latched, §4.3, which removes the loop's other half). Frozen collaterals a
 is distributed too). And
 a flavor whose transfer *fails* — for instance a custodial issuer that has blacklisted the engine
 address — is **skipped rather than reverted**, so a single non-transferable collateral cannot block
-the whole pro-rata exit; its slice simply stays pooled. Above 99% backing, `redeemMix` reverts
+the whole pro-rata exit; its slice simply stays pooled. The skip is bounded, not just non-reverting:
+the token's `transfer` receives a fixed gas stipend and only one word of its return data is ever read,
+so a listed token that turns hostile (a captured proxy that burns all the gas it is given, or returns
+megabytes) costs the redeemer its own leg and nothing more. The same bound applies to every basket-wide
+`balanceOf` read, which otherwise could tax every call in the system. Above 99% backing, `redeemMix` reverts
 (`NotDistressed`) and normal pick-your-flavor redemption with the tilt applies; `previewRedeemMix`
 and `listedCollaterals` support the UI.
 
@@ -527,10 +531,15 @@ safe:
   It is the mirror image of the rejected "clamp a low price up to $1", not a relaxation of it.
 - **Bounded by the sane band.** A compromised-high feed can only shrink a payout as far as the oracle
   adapter's configured upper bound allows (§3.3), and holders can still exit via any other flavor.
-- **Live-only, so the dead-feed exit is untouched.** An unpriceable flavor falls through to its flat base
-  rate at par exactly as before, preserving the oracle-independent exit. The residual is that a flavor
-  which spikes above $1.00 and *then* loses its feed still pays par units; that is the price of the
-  liveness guarantee, and it is bounded by the stale-price grace window.
+- **Clamped against the price backing is counted at, so a feed outage cannot reopen the drain.** With a
+  live feed the clamp uses the live price. On a dead feed it uses the stale-price fallback (§3.3), the same
+  number the backing ratio values the flavor at, and 0 (no clamp, par) once that cache expires. An earlier
+  version clamped on the live price only and accepted "a flavor which spikes above $1.00 and then loses
+  its feed pays par units" as a residual; once the stale fallback shipped that residual became a leak the
+  invariant suite caught: the flavor was *valued* at its cached ~$1.18 but *paid* at par, so every
+  redemption of it lowered backing for the whole grace window. The exit is still oracle-independent in
+  the sense that matters: no feed state can block it, only trim it, and after the grace window it is
+  exactly the flat base rate at par.
 
 ### 5.8 The backing-ratio cap
 
@@ -639,10 +648,12 @@ is load-bearing: it gates minting (§4.3) and is surfaced to users and monitors.
 - **No exit pays more than $1.00 of backing per SumUSD, in either regime** — single-flavor via the
   above-par clamp (§5.7), pro-rata via the `redeemMix` par cap (§5.4). The accumulated surplus is not
   extractable through the distress exit.
-- **No single collateral can brick the basket or the distress exit** — a listed token whose `balanceOf`
-  starts reverting after listing (e.g. a bricked upgradeable proxy) is read defensively wherever the engine
-  walks the whole basket: it values at 0 (so distress triggers honestly), `poolNeeds` never steers deposits
-  into it, and `redeemMix` skips its slice exactly as it skips a failing transfer.
+- **No single collateral can brick, or tax, the basket or the distress exit** — a listed token whose
+  `balanceOf` starts reverting after listing (e.g. a bricked upgradeable proxy) is read defensively wherever
+  the engine walks the whole basket: it values at 0 (so distress triggers honestly), `poolNeeds` never steers
+  deposits into it, and `redeemMix` skips its slice exactly as it skips a failing transfer. Both defensive
+  calls are gas-capped and read at most one word of return data, so a hostile token cannot burn the
+  caller's gas budget (63/64 of it, under EIP-150) or charge it for copying a huge return payload (§5.4).
 - **The convex tilt never gates a flavor** — it prices the extremes continuously (the rate
   approaches 0), rather than reverting (§5.2). A holder is never trapped: SumUSD is a fungible claim,
   so a positive-output flavor is always redeemable, and `redeemMix` covers distress.
