@@ -21,7 +21,7 @@ export const GOV_ABI = parseAbi([
     "function acceptOwnership()",
     "function setCollateral(address token, bool enabled, uint16 redeemRateBps, address oracle)",
     "function setCollateralEnabled(address token, bool enabled)",
-    "function removeCollateral(address token)",
+    "function removeCollateral(address token, uint256 maxResidualUnits)",
     "function setCollateralBackingExcluded(address token, bool excluded)",
     "function setTiltSlopeBps(uint16 slope)",
     "function setRedeemMargin(uint16 totalBps, uint16 toRecipientBps)",
