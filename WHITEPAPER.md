@@ -803,9 +803,12 @@ The engine's owner can:
   priority — favoring GENIUS Act–compliant, Treasury-backed stablecoins, with riskier designs
   admitted only under more conservative parameters;
 - enable/disable a listed collateral (`setCollateralEnabled`);
-- remove a retired collateral (`removeCollateral`) — only if it is disabled and holds a zero
-  balance, so removal can never strand funds or change backing; this frees a slot against the
-  `MAX_COLLATERALS` cap;
+- remove a retired collateral (`removeCollateral(token, maxResidualUnits)`) — only if it is
+  disabled and holds no more than the dust governance names in the queued call, so removal strands at
+  most what governance has explicitly accepted; this frees a slot against the `MAX_COLLATERALS` cap.
+  (An exact-zero requirement was free to grief: one wei transferred to the engine before the timelocked
+  execute reverted it, every round. Exceeding a declared tolerance costs the griefer that much, paid to
+  holders, per round.)
 - tune the imbalance sensitivity (`setTiltSlopeBps`);
 - set the redemption margin and its split (`setRedeemMargin`, railed to `MAX_REDEEM_MARGIN_BPS`) and the margin
   recipient (`setMarginRecipient`);

@@ -753,7 +753,7 @@ contract SumUSDEngineTest is Test {
         uint256 n = engine.collateralCount();
         vm.startPrank(owner);
         engine.setCollateralEnabled(address(d), false); // must be disabled first
-        engine.removeCollateral(address(d));
+        engine.removeCollateral(address(d), 0);
         vm.stopPrank();
         assertEq(engine.collateralCount(), n - 1, "slot freed");
         // Config cleared, so it can be listed fresh again.
@@ -766,7 +766,7 @@ contract SumUSDEngineTest is Test {
         MockERC20 d = _listFreshFlavor();
         vm.prank(owner);
         vm.expectPartialRevert(SumUSDEngine.CollateralStillEnabled.selector);
-        engine.removeCollateral(address(d));
+        engine.removeCollateral(address(d), 0);
     }
 
     function test_RemoveCollateral_RevertsIfNotEmpty() public {
@@ -775,14 +775,45 @@ contract SumUSDEngineTest is Test {
         vm.startPrank(owner);
         engine.setCollateralEnabled(address(d), false);
         vm.expectPartialRevert(SumUSDEngine.CollateralNotEmpty.selector);
-        engine.removeCollateral(address(d));
+        engine.removeCollateral(address(d), 0);
+        // Real holder backing is above any tolerance governance would declare for it: still refused.
+        vm.expectPartialRevert(SumUSDEngine.CollateralNotEmpty.selector);
+        engine.removeCollateral(address(d), 10e6 - 1);
         vm.stopPrank();
+    }
+
+    // WEAKNESS (fixed): removal required an EXACTLY zero balance, and anyone could transfer 1 wei of the
+    // token to the engine (no `donate` needed) the block before the timelocked execute landed, reverting
+    // it, forever, for free. Governance now declares in the queued calldata how much residual it is
+    // willing to strand; a griefer has to give MORE than that to the pool, permanently, every 96h round,
+    // and governance can raise the tolerance each round, so the war costs the griefer and pays holders.
+    function test_RemoveCollateral_DustCannotBlockRemoval() public {
+        MockERC20 d = _listFreshFlavor();
+        _deposit(alice, flavorA, 1_000e6); // unrelated backing, so the ratio is defined
+        vm.prank(owner);
+        engine.setCollateralEnabled(address(d), false);
+        uint256 n = engine.collateralCount();
+        uint256 ratioBefore = engine.systemCollateralizationRatioBps();
+
+        d.mint(bob, 1); // griefer front-runs the execute with 1 wei, straight to the engine
+        vm.prank(bob);
+        d.transfer(address(engine), 1);
+
+        vm.prank(owner);
+        vm.expectEmit(true, false, false, true);
+        emit SumUSDEngine.CollateralRemoved(address(d), 1);
+        engine.removeCollateral(address(d), 1e6); // tolerate up to one unit ($1 at par) of residual
+        assertEq(engine.collateralCount(), n - 1, "slot freed despite the dust");
+        (,,, IPriceOracle o,) = engine.configs(address(d));
+        assertEq(address(o), address(0), "config cleared");
+        assertEq(engine.systemCollateralizationRatioBps(), ratioBefore, "dust never counted toward backing");
+        assertEq(d.balanceOf(address(engine)), 1, "residual stays put (not swept anywhere)");
     }
 
     function test_RemoveCollateral_OnlyOwner() public {
         vm.prank(alice);
         vm.expectRevert();
-        engine.removeCollateral(address(flavorA));
+        engine.removeCollateral(address(flavorA), 0);
     }
 
     // --- distress-mode 99% trigger --------------------------------------

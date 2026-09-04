@@ -148,7 +148,7 @@ queue/execute cycle with `target = $ENGINE`.
 |---|---|
 | List / reconfigure a flavor | `setCollateral(address,bool,uint16,address)` — `(token, enabled, redeemRateBps, oracle)` |
 | Enable / disable (incl. un-freeze) | `setCollateralEnabled(address,bool)` — `(token, enabled)` |
-| Remove a retired flavor (disabled + zero balance) | `removeCollateral(address)` — `(token)` |
+| Remove a retired flavor (disabled, dust only) | `removeCollateral(address,uint256)` — `(token, maxResidualUnits)`. The tolerance is the most balance (token decimals) you accept stranding; an exact-zero check was griefable with 1 wei |
 | Silo / un-silo a stuck flavor (backing exclusion) | `setCollateralBackingExcluded(address,bool)` — `(token, excluded)` |
 
 `redeemRateBps` must be in `[9500, 10000]`; `oracle` is normally `$MEDIAN`. Example listing:
@@ -271,7 +271,13 @@ layer can never be reconfigured again.
 
 1. Ensure it is enabled and let holders redeem it toward zero balance.
 2. Queue + execute `ENGINE.setCollateralEnabled(token, false)`.
-3. Once `balanceOf(engine)` is 0, queue + execute `ENGINE.removeCollateral(token)` to free the slot.
+3. Once `balanceOf(engine)` is down to dust, queue + execute `ENGINE.removeCollateral(token, maxResidualUnits)`
+   to free the slot, with `maxResidualUnits` a little above the current balance (say one whole unit).
+   Anything at or below the tolerance is stranded in the engine and stops counting toward backing, so
+   keep it to dust. Anyone can transfer the token to the engine while the operation waits; if the balance
+   is above your tolerance at execute time the call reverts `CollateralNotEmpty(token, balance, max)`.
+   The griefer has then donated that much to holders for good. Re-queue with a higher tolerance, or let
+   holders redeem it back down first (a disabled flavor stays redeemable at its base rate).
 
 ### Emergency: a collateral is misbehaving
 

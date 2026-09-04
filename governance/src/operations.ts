@@ -72,13 +72,14 @@ export const OPERATIONS: Record<string, Op> = {
         },
     },
     "remove-collateral": {
-        help: "remove-collateral <token>                 remove a retired flavor (disabled + zero balance)",
+        help: "remove-collateral <token> <maxResidualUnits>   remove a retired flavor (disabled; strands at most this much dust)",
         build: (a) => {
             const token = addr(a[0], "token");
+            const maxResidual = u(a[1], "maxResidualUnits");
             return {
                 target: config.engine(),
-                data: encodeFunctionData({abi: GOV_ABI, functionName: "removeCollateral", args: [token]}),
-                description: `engine.removeCollateral(${token})`,
+                data: encodeFunctionData({abi: GOV_ABI, functionName: "removeCollateral", args: [token, maxResidual]}),
+                description: `engine.removeCollateral(${token}, ${maxResidual})`,
                 timelocked: true,
             };
         },

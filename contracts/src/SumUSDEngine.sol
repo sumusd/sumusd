@@ -231,7 +231,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     event TiltSlopeUpdated(uint16 tiltSlopeBps);
     event GuardianUpdated(address indexed guardian);
     event CollateralFrozen(address indexed token, address indexed by);
-    event CollateralRemoved(address indexed token);
+    event CollateralRemoved(address indexed token, uint256 residualUnits);
     event CollateralBackingExcludedSet(address indexed token, bool excluded);
     event RedeemMarginUpdated(uint16 redeemMarginBps, uint16 marginToRecipientBps);
     event MarginRecipientUpdated(address indexed marginRecipient);
@@ -257,7 +257,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error InvalidTiltSlope(uint16 tiltSlopeBps);
     error CollateralCapReached(uint256 max);
     error CollateralStillEnabled(address token);
-    error CollateralNotEmpty(address token);
+    error CollateralNotEmpty(address token, uint256 balance, uint256 maxResidualUnits);
     error InvalidCollateralDecimals(uint8 decimals);
     error CollateralProbeFailed(address token);
     error UseRedeemMix(uint256 ratioBps);
@@ -945,17 +945,27 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         emit CollateralUpdated(collateral, enabled, c.redeemRateBps, address(c.oracle));
     }
 
-    /// @notice Remove a fully-retired collateral from the list to free a slot (against the
-    ///         {MAX_COLLATERALS} cap). The collateral must be disabled and hold a zero balance, so
-    ///         removal can never strand funds or change the backing ratio. After removal the token is
-    ///         fully de-listed (config cleared) and could be listed again fresh.
-    /// @dev To retire a collateral that still holds a balance: re-enable it, let holders redeem it to
-    ///      zero, disable it, then remove. Owner (timelock) only.
-    function removeCollateral(address collateral) external onlyOwner {
+    /// @notice Remove a retired collateral from the list to free a slot (against the {MAX_COLLATERALS}
+    ///         cap). The collateral must be disabled and hold at most `maxResidualUnits` of balance, so
+    ///         removal can strand at most the dust governance has explicitly agreed to strand. After
+    ///         removal the token is fully de-listed (config cleared) and could be listed again fresh.
+    /// @dev Why a tolerance rather than an exact-zero check: an exact check was griefable for free.
+    ///      Anyone could transfer 1 wei of the token to the engine (no {donate} needed) the block before
+    ///      the timelocked execute landed, reverting it, and repeat every round. The tolerance is part of
+    ///      the queued calldata, so a griefer must give MORE than that to the pool, permanently, every
+    ///      96h round, and governance can raise it each round: the war costs the griefer and pays holders.
+    ///      Governance reads `balanceOf(engine)` when queuing and should set the tolerance to dust only;
+    ///      anything left in the engine at removal is stranded (unreachable until re-listed) and, since
+    ///      the config is deleted, no longer counts toward backing. To retire a collateral still holding
+    ///      real balance: disable it, let holders redeem it down, then remove. Owner (timelock) only.
+    /// @param collateral        Listed, disabled collateral to de-list.
+    /// @param maxResidualUnits  Largest balance (token decimals) governance accepts leaving behind.
+    function removeCollateral(address collateral, uint256 maxResidualUnits) external onlyOwner {
         CollateralConfig storage c = configs[collateral];
         if (address(c.oracle) == address(0)) revert CollateralNotEnabled(collateral); // not listed
         if (c.enabled) revert CollateralStillEnabled(collateral);
-        if (IERC20(collateral).balanceOf(address(this)) != 0) revert CollateralNotEmpty(collateral);
+        uint256 residual = IERC20(collateral).balanceOf(address(this));
+        if (residual > maxResidualUnits) revert CollateralNotEmpty(collateral, residual, maxResidualUnits);
 
         uint256 len = collateralList.length;
         for (uint256 i; i < len; ++i) {
@@ -966,7 +976,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
             }
         }
         delete configs[collateral];
-        emit CollateralRemoved(collateral);
+        emit CollateralRemoved(collateral, residual);
     }
 
     /// @notice Exclude (or re-include) a listed collateral from the backing/solvency and tilt math —

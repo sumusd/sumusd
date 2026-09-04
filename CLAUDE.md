@@ -265,9 +265,13 @@ base rate, tilt, and margin but never set a punitive payout, an unredeemable slo
 5 bps (0.05%). `setMarginRecipient` sets the margin's destination (all owner/timelock-gated).
 
 **Collateral-list cap:** the basket is capped at `MAX_COLLATERALS` (24) so the basket-wide loops
-can't grow unbounded; `removeCollateral` de-lists a **disabled + zero-balance** collateral
-(swap-and-pop, config cleared) to free a slot. (To retire one still holding a balance: re-enable →
-let it be redeemed to zero → disable → remove.)
+can't grow unbounded; `removeCollateral(token, maxResidualUnits)` de-lists a **disabled** collateral
+holding **at most the declared dust** (swap-and-pop, config cleared; the residual is stranded and stops
+counting toward backing) to free a slot. The tolerance exists because an exact-zero check was griefable
+for free: anyone could transfer 1 wei to the engine the block before the timelocked execute and revert it
+every round. Now the griefer must exceed the queued tolerance, permanently gifting that to holders each
+96h round, and governance can raise it per round. Set it to dust; read `balanceOf(engine)` when queuing.
+(To retire one still holding real balance: disable → let holders redeem it down → remove.)
 
 **Listing sanity probe (`_probeCollateral`):** on FIRST listing, `setCollateral` requires the token
 be a conforming ERC-20 (has code; `decimals()` and `balanceOf()` callable) with `decimals <=
