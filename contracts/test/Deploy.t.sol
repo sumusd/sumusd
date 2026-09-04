@@ -90,7 +90,7 @@ contract DeployTest is Test {
         // The oracle owner is the timelock, so no EOA (the deployer included) can set feeds/sources.
         vm.prank(deployer);
         vm.expectRevert();
-        provider1.setFeed(makeAddr("tok"), makeAddr("agg"), 1 hours, 0.9e18, 1.1e18);
+        provider1.setFeed(makeAddr("tok"), makeAddr("agg"), 1 hours, 1.1e18);
     }
 
     /// @dev The core property: no EOA can grant itself MINTER_ROLE post-deploy, so no hot key can mint

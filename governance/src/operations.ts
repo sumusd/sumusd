@@ -168,15 +168,15 @@ export const OPERATIONS: Record<string, Op> = {
         }),
     },
     "set-feed": {
-        help: "set-feed <provider> <token> <agg> <maxStaleness> <minWad> <maxWad>   point a provider at a Chainlink feed",
+        help: "set-feed <provider> <token> <agg> <maxStaleness> <maxWad>   point a provider at a Chainlink feed",
         build: (a) => ({
             target: addr(a[0], "provider"),
             data: encodeFunctionData({
                 abi: GOV_ABI,
                 functionName: "setFeed",
-                args: [addr(a[1], "token"), addr(a[2], "aggregator"), Number(u(a[3], "maxStaleness")), u(a[4], "minPriceWad"), u(a[5], "maxPriceWad")],
+                args: [addr(a[1], "token"), addr(a[2], "aggregator"), Number(u(a[3], "maxStaleness")), u(a[4], "maxPriceWad")],
             }),
-            description: `provider(${a[0]}).setFeed(${a[1]}, ${a[2]}, ${a[3]}, ${a[4]}, ${a[5]})`,
+            description: `provider(${a[0]}).setFeed(${a[1]}, ${a[2]}, ${a[3]}, ${a[4]})`,
             timelocked: true,
         }),
     },

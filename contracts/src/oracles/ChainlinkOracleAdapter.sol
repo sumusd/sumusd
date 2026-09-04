@@ -11,12 +11,23 @@ import {AggregatorV3Interface} from "../interfaces/AggregatorV3Interface.sol";
 /// @notice Production {IPriceOracle} that wraps a Chainlink AggregatorV3 feed per collateral and
 ///         normalizes its answer to an 18-decimal WAD (`1e18 == $1.00`). It is deliberately
 ///         **fail-closed**: `getPriceWad` REVERTS on any feed that is stale, incomplete, non-positive,
-///         or outside a configured sane band. The {SumUSDEngine} reads collateral prices through a
+///         or above a configured sane ceiling. The {SumUSDEngine} reads collateral prices through a
 ///         try/catch (`_tryPriceWad`), so a revert here is treated as "unpriceable" and that collateral
-///         is valued at **0** (conservative) rather than at a stale or garbage price — never up. This
-///         closes the "stale-but-returning feed" gap: a frozen feed that keeps returning $1.00 for a
-///         depegged asset is rejected once it passes the staleness bound, instead of silently keeping
-///         the asset valued at par.
+///         is valued at **0** (conservative) — or, if the engine's stale-price fallback is on, at its
+///         last-good price minus a haircut for a bounded grace window — rather than at a stale or
+///         garbage price. This closes the "stale-but-returning feed" gap: a frozen feed that keeps
+///         returning $1.00 for a depegged asset is rejected once it passes the staleness bound, instead
+///         of silently keeping the asset valued at par.
+///
+///         **Low answers are passed through, never rejected.** A revert is not a neutral outcome: the
+///         engine may bridge it with the last-good price, which is HIGHER than a crashed live price. So
+///         an absolute lower "sane floor" (rejecting e.g. anything under $0.90 as a malfunction) would
+///         make a genuine crash past that floor indistinguishable from a feed outage — the flavor would
+///         hold its pre-crash value for the whole grace window, backing would read healthy, and the
+///         pick-your-flavor redeem would stay open for a first-redeemer run on the healthy flavors. A
+///         fresh, positive, in-range-decimals answer that is merely LOW is therefore reported as-is; the
+///         engine values the flavor down (the conservative direction) and trips distress honestly. Only
+///         an implausibly HIGH answer — the direction that would inflate backing — is rejected.
 ///
 /// @dev The engine calls this directly on the deposit peg-band guard (so a stale feed blocks deposits
 ///      of that flavor) and via try/catch everywhere else (so a stale feed just drops the flavor to 0
@@ -28,8 +39,7 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
         address aggregator; // Chainlink AggregatorV3 feed for token/USD
         uint8 feedDecimals; // cached aggregator.decimals()
         uint32 maxStaleness; // seconds; reject an answer older than this (feed heartbeat + buffer)
-        uint128 minPriceWad; // absolute sane lower bound (WAD); reject a price below it
-        uint128 maxPriceWad; // absolute sane upper bound (WAD); reject a price above it
+        uint128 maxPriceWad; // absolute sane ceiling (WAD); reject a price above it (a low price passes through)
     }
 
     /// @notice Feed configuration per collateral token.
@@ -50,24 +60,19 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     event SequencerFeedConfigured(address indexed feed, uint32 gracePeriod);
 
     event FeedConfigured(
-        address indexed token,
-        address indexed aggregator,
-        uint8 feedDecimals,
-        uint32 maxStaleness,
-        uint128 minPriceWad,
-        uint128 maxPriceWad
+        address indexed token, address indexed aggregator, uint8 feedDecimals, uint32 maxStaleness, uint128 maxPriceWad
     );
     event FeedRemoved(address indexed token);
 
     error FeedNotConfigured(address token);
     error ZeroAggregator();
     error InvalidStaleness();
-    error InvalidSaneBand(uint128 minPriceWad, uint128 maxPriceWad);
+    error InvalidSaneCeiling();
     error InvalidAnswer(address token, int256 answer);
     error RoundNotComplete(address token);
     error StaleRound(address token, uint80 roundId, uint80 answeredInRound);
     error StalePrice(address token, uint256 updatedAt, uint256 nowTs);
-    error PriceOutOfSaneBand(address token, uint256 priceWad);
+    error PriceAboveSaneCeiling(address token, uint256 priceWad);
     error SequencerDown();
     error SequencerGracePeriod(uint256 upSince, uint256 readyAt);
 
@@ -82,26 +87,19 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
     /// @param aggregator   Chainlink AggregatorV3 feed (token/USD). Its decimals are read and cached.
     /// @param maxStaleness Max age (seconds) of a round before it is rejected. Set to the feed's
     ///                     heartbeat plus a safety buffer. Must be > 0.
-    /// @param minPriceWad  Absolute lower sane bound (WAD). A price below it is rejected as a feed
-    ///                     malfunction. Must be > 0 and <= `maxPriceWad`.
-    /// @param maxPriceWad  Absolute upper sane bound (WAD). A price above it is rejected.
-    function setFeed(address token, address aggregator, uint32 maxStaleness, uint128 minPriceWad, uint128 maxPriceWad)
-        external
-        onlyOwner
-    {
+    /// @param maxPriceWad  Absolute sane ceiling (WAD). A price above it is rejected as a feed malfunction
+    ///                     (the direction that would inflate backing). Must be > 0. There is deliberately
+    ///                     no floor: a low answer is a depeg signal and is passed through (see above).
+    function setFeed(address token, address aggregator, uint32 maxStaleness, uint128 maxPriceWad) external onlyOwner {
         if (aggregator == address(0)) revert ZeroAggregator();
         if (maxStaleness == 0) revert InvalidStaleness();
-        if (minPriceWad == 0 || minPriceWad > maxPriceWad) revert InvalidSaneBand(minPriceWad, maxPriceWad);
+        if (maxPriceWad == 0) revert InvalidSaneCeiling();
 
         uint8 feedDecimals = AggregatorV3Interface(aggregator).decimals();
         feeds[token] = FeedConfig({
-            aggregator: aggregator,
-            feedDecimals: feedDecimals,
-            maxStaleness: maxStaleness,
-            minPriceWad: minPriceWad,
-            maxPriceWad: maxPriceWad
+            aggregator: aggregator, feedDecimals: feedDecimals, maxStaleness: maxStaleness, maxPriceWad: maxPriceWad
         });
-        emit FeedConfigured(token, aggregator, feedDecimals, maxStaleness, minPriceWad, maxPriceWad);
+        emit FeedConfigured(token, aggregator, feedDecimals, maxStaleness, maxPriceWad);
     }
 
     /// @notice Configure (or clear, with `feed == address(0)`) the L2 Sequencer Uptime Feed and the grace
@@ -128,7 +126,8 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
 
     /// @inheritdoc IPriceOracle
     /// @dev Reverts (fail-closed) unless the latest round is positive, complete, fresh within
-    ///      `maxStaleness`, not a carried-over stale answer, and within the configured sane band.
+    ///      `maxStaleness`, not a carried-over stale answer, and at or below the configured sane ceiling.
+    ///      A low answer is returned as-is (see the contract notice for why there is no floor).
     function getPriceWad(address token) external view returns (uint256 priceWad) {
         _requireSequencerUp();
 
@@ -146,7 +145,7 @@ contract ChainlinkOracleAdapter is IPriceOracle, Ownable2Step {
         if (block.timestamp - updatedAt > f.maxStaleness) revert StalePrice(token, updatedAt, block.timestamp);
 
         priceWad = _scaleToWad(uint256(answer), f.feedDecimals);
-        if (priceWad < f.minPriceWad || priceWad > f.maxPriceWad) revert PriceOutOfSaneBand(token, priceWad);
+        if (priceWad > f.maxPriceWad) revert PriceAboveSaneCeiling(token, priceWad);
     }
 
     // ---------------------------------------------------------------------

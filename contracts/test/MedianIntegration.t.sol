@@ -58,10 +58,10 @@ contract MedianIntegrationTest is Test {
         aggB2 = new MockAggregatorV3(8, 1e8, block.timestamp);
 
         // Each provider wraps its own aggregator per flavor.
-        o1.setFeed(address(a), address(aggA1), STALENESS, 0.9e18, 1.1e18);
-        o2.setFeed(address(a), address(aggA2), STALENESS, 0.9e18, 1.1e18);
-        o1.setFeed(address(b), address(aggB1), STALENESS, 0.9e18, 1.1e18);
-        o2.setFeed(address(b), address(aggB2), STALENESS, 0.9e18, 1.1e18);
+        o1.setFeed(address(a), address(aggA1), STALENESS, 1.1e18);
+        o2.setFeed(address(a), address(aggA2), STALENESS, 1.1e18);
+        o1.setFeed(address(b), address(aggB1), STALENESS, 1.1e18);
+        o2.setFeed(address(b), address(aggB2), STALENESS, 1.1e18);
 
         // Median over both providers, per flavor.
         IPriceOracle[] memory srcs = new IPriceOracle[](2);

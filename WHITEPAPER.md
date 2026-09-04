@@ -155,6 +155,20 @@ governance. Crucially, it only engages when there is *no* live price at all; a l
 genuinely low price (a real de-peg) is used as-is, so distress still triggers correctly on actual
 insolvency. `livePriceWad` / `valuationPriceWad` / `lastGoodPriceAt` surface feed health for a UI.
 
+**A revert is not a neutral outcome, so adapters must not reject LOW prices.** Because the engine may
+bridge an oracle revert with the (higher) last-good price, any adapter rule that turns a *low live
+answer* into a revert converts a real crash into an apparent outage: the flavor would hold its pre-crash
+value for the whole grace window, backing would read healthy, and the pick-your-flavor `redeem` would stay
+open for exactly the first-redeemer run the distress gate exists to stop. The production
+`ChainlinkOracleAdapter` therefore carries an absolute sane **ceiling** only (an implausibly high answer,
+the direction that would inflate backing, is rejected); a fresh positive answer that is merely low is
+passed through and valued as-is. An earlier version had a symmetric sane floor; it was removed once the
+stale-price fallback made the masking path reachable. The same reasoning applies to any custom
+`IPriceOracle`: fail closed on *unavailable* (stale, incomplete, sequencer down), never on *low*.
+(The `MedianOracleAdapter`'s disagreement breaker still reverts on a wide spread; that condition is
+transient during a crash, since deviation-triggered feeds re-converge within minutes, and is bounded by
+the same grace window.)
+
 It is important to understand *where the oracle is and is not used*:
 
 - It **does not** price minting *or* redemption — both are fungible 1:1 unit swaps (§4, §5).
@@ -461,10 +475,11 @@ for cutting N approvals/transactions to one. It changes no economics:
   single redemptions for solvency purposes.
 - **Distress gate, once.** The distress check (§5.4) runs once, up front: while distressed the whole
   batch reverts `UseRedeemMix` and the holder exits via `redeemMix`. A batch that begins in normal mode
-  stays in it, because with the above-par clamp (§5.7) a redemption removes at most $1.00 of value per
-  SumUSD burned and therefore can never lower the backing ratio below 100%. (Before that clamp this was
-  not true: redeeming a flavor trading above the current ratio *did* lower backing, and the claim that
-  "redemptions only raise backing" was false in exactly that case.)
+  stays in it, because a redemption can never lower the backing ratio: the above-par clamp (§5.7) bounds
+  the value removed at $1.00 per SumUSD burned, and the backing-ratio cap (§5.8) bounds it at the pool's
+  current backing per SumUSD whenever that is below par. (Each of those was added after a case where
+  "redemptions only raise backing" turned out to be false: a flavor trading above $1 drained at par, and
+  a 100%-rate redemption from a pool backed at 99.5%.)
 - **Atomic.** Any leg that would revert on its own — unlisted collateral, dust, per-leg slippage
   (`minOuts[i]`), insufficient pool, or a length mismatch across the three arrays — reverts the entire
   call, so a batch either settles completely or not at all.
@@ -499,6 +514,32 @@ safe:
   rate at par exactly as before, preserving the oracle-independent exit. The residual is that a flavor
   which spikes above $1.00 and *then* loses its feed still pays par units; that is the price of the
   liveness guarantee, and it is bounded by the stale-price grace window.
+
+### 5.8 The backing-ratio cap
+
+Outside distress, backing can legitimately sit **between the 99% floor and par**: worst-case in-band
+deposits settle it toward 99.5% (§4.3), and a mild depeg of one flavor can hold it anywhere in that band
+without ever crossing the distress line. In that state a single-flavor redemption paid at an effective
+rate *above* the ratio (a flavor with a 100% base rate, or one earning the overweight bonus) hands the
+redeemer more per SumUSD than the pool holds per SumUSD. Every such exit pushes the remaining holders'
+backing *down* — the first-redeemer dynamic one step at a time — and one large enough redemption could
+walk a 99.5%-backed pool straight through the 99% line without ever being gated, because the distress
+check is a pre-check.
+
+So the effective rate is additionally **capped at the backing ratio** (`_capAtBacking`): a redemption
+from a pool backed at 99.5¢ per SumUSD pays at most 99.5¢ per SumUSD. Properties:
+
+- **Conservative direction only.** It never raises a payout. It is the below-par mirror of the above-par
+  clamp, and is applied *before* it, so an above-$1 flavor's value per SumUSD is bounded by the ratio too.
+- **Never binds where it could hurt liveness.** The ratio can only cap when it is under 100%, and it is
+  never below 99% while single-flavor redemption is open (below that the latch has already routed holders
+  to `redeemMix`), so the cap costs a redeemer at most one percentage point and never approaches zero.
+- **Makes every redemption ratio-non-decreasing.** With the cap, the value leaving per SumUSD burned never
+  exceeds the value held per SumUSD, so `systemCollateralizationRatioBps()` cannot fall on a redemption in
+  any regime — the invariant `redeemBatch`'s single distress check relies on (§5.6), and one that also
+  closes the par-mint arbitrage's payoff whenever backing is below par (deposit at $0.995, redeem at the
+  ratio, not at $1). The dead-feed base-rate exit is capped the same way; it stays oracle-independent in
+  units and can only be trimmed, never blocked.
 
 ---
 
@@ -574,6 +615,13 @@ is load-bearing: it gates minting (§4.3) and is surfaced to users and monitors.
   `1/price`, so a redemption never removes more than $1.00 of mark-to-market value per SumUSD burned
   (§5.7). The unit clamp alone was not enough: a flavor trading at $1.05 could be drained at par, which
   extracted more value than was burned and *lowered* the backing ratio.
+- **No redemption lowers the backing ratio** — the effective rate is also capped at the current backing
+  ratio (§5.8), so the value leaving per SumUSD burned never exceeds the value held per SumUSD, in any
+  regime. Checked by a stateful invariant across price moves, dead feeds and the stale fallback.
+- **No single collateral can brick the basket or the distress exit** — a listed token whose `balanceOf`
+  starts reverting after listing (e.g. a bricked upgradeable proxy) is read defensively wherever the engine
+  walks the whole basket: it values at 0 (so distress triggers honestly), `poolNeeds` never steers deposits
+  into it, and `redeemMix` skips its slice exactly as it skips a failing transfer.
 - **The convex tilt never gates a flavor** — it prices the extremes continuously (the rate
   approaches 0), rather than reverting (§5.2). A holder is never trapped: SumUSD is a fungible claim,
   so a positive-output flavor is always redeemable, and `redeemMix` covers distress.
@@ -837,7 +885,9 @@ could even reach is small and slow.
   backing). Production deployments must use a robust feed that reverts on staleness, and may layer
   per-collateral redundancy. Note that a *reverting* feed is handled gracefully — `_tryPriceWad`
   values that collateral at 0 so one dead feed cannot brick the protocol (§3.3); the residual risk
-  is a feed that returns a confidently-wrong price.
+  is a feed that returns a confidently-wrong price. With the stale-price fallback enabled, a revert is
+  bridged by the last-good price for the grace window, which is why adapters must never turn a low live
+  answer into a revert (§3.3): "unavailable" may be bridged, "low" must be believed.
 - **Fungibility trade-off.** Both mint and redeem are 1:1 unit swaps, so the protocol assumes par
   on both sides; the oracle only measures (backing ratio, tilt weights) and gates deposits (peg
   band). A holder of a flavor that has drifted below $1 is not compensated with extra units on

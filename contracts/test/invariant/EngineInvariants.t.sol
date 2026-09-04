@@ -140,6 +140,14 @@ abstract contract EngineInvariantBase is Test {
         assertTrue(handler.singleRedeemNeverInDistress(), "single redeem cleared below the distress line");
     }
 
+    /// A single-flavor redemption never lowers the backing ratio, in ANY regime (prices moving, feeds dying,
+    /// stale fallback on). Outside distress the ratio can sit between 99% and par; the effective rate is
+    /// capped at that ratio so an exit can never hand out more per SumUSD than the pool holds per SumUSD.
+    /// This is the premise behind `redeemBatch`'s single up-front distress check, now enforced.
+    function invariant_singleRedeemNeverLowersRatio() public view {
+        assertTrue(handler.singleRedeemNeverLoweredRatio(), "single redeem lowered the backing ratio");
+    }
+
     /// The recovery clock only ever runs while the latch is set, and the published clearing time always
     /// agrees with it.
     function invariant_distressLatchConsistent() public view {

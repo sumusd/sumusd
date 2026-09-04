@@ -41,8 +41,8 @@ contract OracleIntegrationTest is Test {
         b = new MockERC20("Flavor B", "FLAV-B", 6);
         feedA = new MockAggregatorV3(8, 1e8, block.timestamp);
         feedB = new MockAggregatorV3(8, 1e8, block.timestamp);
-        adapter.setFeed(address(a), address(feedA), STALENESS, 0.9e18, 1.1e18);
-        adapter.setFeed(address(b), address(feedB), STALENESS, 0.9e18, 1.1e18);
+        adapter.setFeed(address(a), address(feedA), STALENESS, 1.1e18);
+        adapter.setFeed(address(b), address(feedB), STALENESS, 1.1e18);
 
         engine.setCollateral(address(a), true, 9900, adapter);
         engine.setCollateral(address(b), true, 9900, adapter);
@@ -116,5 +116,35 @@ contract OracleIntegrationTest is Test {
         // Feed publishes a fresh round -> deposits of B work again, no admin action needed.
         feedB.setAnswer(1e8, block.timestamp);
         assertEq(_deposit(makeAddr("u3"), b, 1e6), 1e18, "deposit self-heals on feed recovery");
+    }
+
+    // -----------------------------------------------------------------
+    // WEAKNESS (fixed): the adapter used to REJECT a live price below an absolute "sane floor" ($0.90).
+    // Combined with the engine's stale-price fallback, a genuine crash past that floor read exactly like
+    // a feed outage: the flavor was valued at its last-good price minus 1% for the whole grace window,
+    // backing looked healthy, and the pick-your-flavor redeem stayed open — the first-redeemer run the
+    // distress gate exists to stop. A live LOW price is now passed through and valued as-is (the
+    // conservative direction); only an implausibly HIGH answer is rejected.
+    // -----------------------------------------------------------------
+    function test_Fix_CrashBelowOldSaneFloorIsValuedNotMasked() public {
+        vm.prank(owner);
+        engine.setStalePriceParams(6 hours, 100); // reference fallback config
+        _deposit(makeAddr("lp"), a, 10_000e6);
+        address u = makeAddr("u");
+        _deposit(u, b, 5_000e6); // B is one third of the pool
+        engine.refreshPrices(); // last-good cache warm (anyone can keep it warm every block)
+
+        // B's issuer collapses: the feed publishes a FRESH $0.50. True backing = (10,000 + 2,500) / 15,000.
+        feedB.setAnswer(0.5e8, block.timestamp);
+
+        assertEq(engine.collateralValueUsd(address(b)), 2_500e18, "a live low price is used as-is, never masked");
+        assertEq(engine.systemCollateralizationRatioBps(), 8333, "backing reflects the crash");
+        engine.pokeDistress();
+        assertTrue(engine.distressed(), "a real crash trips distress immediately");
+
+        // Cherry-picking the healthy flavor is sealed; holders share the loss via redeemMix.
+        vm.prank(u);
+        vm.expectPartialRevert(SumUSDEngine.UseRedeemMix.selector);
+        engine.redeem(address(a), 1_000e18, 0);
     }
 }

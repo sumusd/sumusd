@@ -14,7 +14,6 @@ contract ChainlinkOracleAdapterTest is Test {
     address internal token = makeAddr("token");
 
     uint32 internal constant STALENESS = 1 hours;
-    uint128 internal constant MIN_WAD = 0.9e18;
     uint128 internal constant MAX_WAD = 1.1e18;
 
     function setUp() public {
@@ -24,7 +23,7 @@ contract ChainlinkOracleAdapterTest is Test {
         // 8-decimal feed reading $1.00, fresh as of now.
         feed = new MockAggregatorV3(8, 1e8, block.timestamp);
         vm.prank(owner);
-        adapter.setFeed(token, address(feed), STALENESS, MIN_WAD, MAX_WAD);
+        adapter.setFeed(token, address(feed), STALENESS, MAX_WAD);
     }
 
     // --- happy path & scaling -------------------------------------------
@@ -37,7 +36,7 @@ contract ChainlinkOracleAdapterTest is Test {
         MockAggregatorV3 f18 = new MockAggregatorV3(18, 1.0005e18, block.timestamp);
         address t2 = makeAddr("t2");
         vm.prank(owner);
-        adapter.setFeed(t2, address(f18), STALENESS, MIN_WAD, MAX_WAD);
+        adapter.setFeed(t2, address(f18), STALENESS, MAX_WAD);
         assertEq(adapter.getPriceWad(t2), 1.0005e18, "18-decimal feed passes through");
     }
 
@@ -45,11 +44,11 @@ contract ChainlinkOracleAdapterTest is Test {
         MockAggregatorV3 f20 = new MockAggregatorV3(20, 1e20, block.timestamp);
         address t3 = makeAddr("t3");
         vm.prank(owner);
-        adapter.setFeed(t3, address(f20), STALENESS, MIN_WAD, MAX_WAD);
+        adapter.setFeed(t3, address(f20), STALENESS, MAX_WAD);
         assertEq(adapter.getPriceWad(t3), WAD, "20-decimal feed scales down to WAD");
     }
 
-    function test_RealDepegWithinSaneBandIsReturned() public {
+    function test_RealDepegIsReturned() public {
         // A genuine depeg to $0.95 is inside the sane band, so the adapter returns it (the engine's
         // own 0.5% deposit peg band is what gates deposits — the oracle only reports).
         feed.setAnswer(0.95e8, block.timestamp);
@@ -97,15 +96,19 @@ contract ChainlinkOracleAdapterTest is Test {
         assertEq(adapter.getPriceWad(token), WAD, "answer exactly at staleness bound is accepted");
     }
 
-    function test_Revert_BelowSaneBand() public {
-        feed.setAnswer(0.5e8, block.timestamp); // $0.50 -> below 0.9 sane floor (feed malfunction)
-        vm.expectPartialRevert(ChainlinkOracleAdapter.PriceOutOfSaneBand.selector);
-        adapter.getPriceWad(token);
+    function test_LowAnswerPassesThrough() public {
+        // A fresh, positive answer that is merely LOW is a depeg signal, not a malfunction: it must be
+        // reported as-is so the engine values the flavor DOWN. Rejecting it would let the engine's stale
+        // fallback bridge a real crash with the (higher) last-good price.
+        feed.setAnswer(0.5e8, block.timestamp); // $0.50
+        assertEq(adapter.getPriceWad(token), 0.5e18, "low price is passed through, never masked");
+        feed.setAnswer(1, block.timestamp); // 1e-8 dollars: still a valid (catastrophic) reading
+        assertEq(adapter.getPriceWad(token), 1e10, "even a near-zero answer is reported, not rejected");
     }
 
-    function test_Revert_AboveSaneBand() public {
-        feed.setAnswer(5e8, block.timestamp); // $5.00 -> above 1.1 sane ceiling
-        vm.expectPartialRevert(ChainlinkOracleAdapter.PriceOutOfSaneBand.selector);
+    function test_Revert_AboveSaneCeiling() public {
+        feed.setAnswer(5e8, block.timestamp); // $5.00 -> above the 1.1 sane ceiling (would inflate backing)
+        vm.expectPartialRevert(ChainlinkOracleAdapter.PriceAboveSaneCeiling.selector);
         adapter.getPriceWad(token);
     }
 
@@ -120,28 +123,25 @@ contract ChainlinkOracleAdapterTest is Test {
     function test_Revert_SetFeed_ZeroAggregator() public {
         vm.prank(owner);
         vm.expectRevert(ChainlinkOracleAdapter.ZeroAggregator.selector);
-        adapter.setFeed(token, address(0), STALENESS, MIN_WAD, MAX_WAD);
+        adapter.setFeed(token, address(0), STALENESS, MAX_WAD);
     }
 
     function test_Revert_SetFeed_ZeroStaleness() public {
         vm.prank(owner);
         vm.expectRevert(ChainlinkOracleAdapter.InvalidStaleness.selector);
-        adapter.setFeed(token, address(feed), 0, MIN_WAD, MAX_WAD);
+        adapter.setFeed(token, address(feed), 0, MAX_WAD);
     }
 
-    function test_Revert_SetFeed_InvalidBand() public {
-        vm.startPrank(owner);
-        vm.expectPartialRevert(ChainlinkOracleAdapter.InvalidSaneBand.selector);
-        adapter.setFeed(token, address(feed), STALENESS, 0, MAX_WAD); // min == 0
-        vm.expectPartialRevert(ChainlinkOracleAdapter.InvalidSaneBand.selector);
-        adapter.setFeed(token, address(feed), STALENESS, 1.2e18, 1.1e18); // min > max
-        vm.stopPrank();
+    function test_Revert_SetFeed_ZeroCeiling() public {
+        vm.prank(owner);
+        vm.expectRevert(ChainlinkOracleAdapter.InvalidSaneCeiling.selector);
+        adapter.setFeed(token, address(feed), STALENESS, 0);
     }
 
     function test_Revert_SetFeed_NotOwner() public {
         vm.prank(makeAddr("rando"));
         vm.expectRevert();
-        adapter.setFeed(token, address(feed), STALENESS, MIN_WAD, MAX_WAD);
+        adapter.setFeed(token, address(feed), STALENESS, MAX_WAD);
     }
 
     function test_RemoveFeed() public {

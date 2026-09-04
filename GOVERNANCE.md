@@ -163,7 +163,7 @@ Provider feeds (target `$PROVIDER1` / `$PROVIDER2`):
 
 | Action | Inner call |
 |---|---|
-| Point a provider at a Chainlink feed | `setFeed(address,address,uint32,uint128,uint128)` — `(token, aggregator, maxStaleness, minPriceWad, maxPriceWad)` |
+| Point a provider at a Chainlink feed | `setFeed(address,address,uint32,uint128)` — `(token, aggregator, maxStaleness, maxPriceWad)`. Ceiling only: a low answer is a depeg and is passed through, never rejected |
 | Remove a provider feed | `removeFeed(address)` — `(token)` |
 | Set the L2 sequencer uptime gate | `setSequencerFeed(address,uint32)` — `(uptimeFeed, gracePeriod)` |
 
@@ -188,9 +188,9 @@ gas. A 3-of-5 quorum still fits. Two further points are policy, not code:
   unset (`address(0)`) on mainnet.
 
 ```bash
-# provider 1 -> Chainlink feed for TOKEN: 1h staleness, sane band [$0.90, $1.10]
-DATA=$(cast calldata "setFeed(address,address,uint32,uint128,uint128)" \
-  $TOKEN $AGGREGATOR 3600 900000000000000000 1100000000000000000)
+# provider 1 -> Chainlink feed for TOKEN: 1h staleness, sane ceiling $1.10 (no floor: low = depeg, valued as-is)
+DATA=$(cast calldata "setFeed(address,address,uint32,uint128)" \
+  $TOKEN $AGGREGATOR 3600 1100000000000000000)
 
 # median over both providers: quorum 1, 1% disagreement breaker
 DATA=$(cast calldata "setSources(address,address[],uint32,uint32)" \
@@ -259,7 +259,7 @@ layer can never be reconfigured again.
 ### List a new collateral flavor (end to end)
 
 1. Deploy/confirm the token's Chainlink aggregators exist on-chain.
-2. Queue `PROVIDER1.setFeed(token, agg1, staleness, min, max)` and `PROVIDER2.setFeed(token, agg2, ...)`.
+2. Queue `PROVIDER1.setFeed(token, agg1, staleness, maxWad)` and `PROVIDER2.setFeed(token, agg2, ...)`.
 3. Queue `MEDIAN.setSources(token, [PROVIDER1, PROVIDER2], minFresh, maxSpreadBps)`.
 4. Queue `ENGINE.setCollateral(token, true, redeemRateBps, MEDIAN)`.
 5. Wait 96h; execute all four, **within the 14-day grace window** (they can share the wait — queue them

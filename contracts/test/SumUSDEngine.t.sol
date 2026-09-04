@@ -9,6 +9,7 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockOracle} from "./mocks/MockOracle.sol";
 import {BlacklistMockERC20} from "./mocks/BlacklistMockERC20.sol";
 import {RevertingBalanceMock} from "./mocks/RevertingBalanceMock.sol";
+import {ToggleBalanceMockERC20} from "./mocks/ToggleBalanceMockERC20.sol";
 
 contract SumUSDEngineTest is Test {
     uint256 internal constant WAD = 1e18;
@@ -1058,5 +1059,45 @@ contract SumUSDEngineTest is Test {
         vm.prank(bob);
         vm.expectRevert(SumUSDEngine.ZeroAmount.selector);
         engine.donate(address(flavorA), 0);
+    }
+
+    // --- a listed flavor whose balanceOf starts reverting -----------------------------------------------
+    // The listing probe checks balanceOf once; an upgradeable token can break AFTER listing. That must not
+    // brick the basket-wide loops (every deposit/redeem/view) or the pro-rata distress exit: the broken
+    // flavor values at 0 (conservative), distress triggers honestly, and redeemMix skips its slice.
+
+    function test_BrickedBalanceOf_NeverBricksBasketOrDistressExit() public {
+        ToggleBalanceMockERC20 bad = new ToggleBalanceMockERC20("Bad", "BAD", 6);
+        oracle.setPrice(address(bad), WAD);
+        vm.prank(owner);
+        engine.setCollateral(address(bad), true, uint16(BPS), oracle);
+        _deposit(alice, flavorA, 1_000e6);
+        bad.mint(alice, 1_000e6);
+        vm.startPrank(alice);
+        bad.approve(address(engine), 1_000e6);
+        engine.deposit(address(bad), 1_000e6, 0);
+        vm.stopPrank();
+        assertEq(engine.systemCollateralizationRatioBps(), BPS);
+
+        bad.setBalanceReverts(true);
+
+        // Basket loops keep working; the broken flavor counts 0 so the ratio is honest and distress latches.
+        assertEq(engine.collateralValueUsd(address(bad)), 0, "unreadable balance values at 0");
+        assertEq(engine.systemCollateralizationRatioBps(), 5000, "ratio reflects the unreachable half");
+        assertTrue(engine.poolNeeds() != address(bad), "poolNeeds never steers deposits into the unreadable flavor");
+        engine.pokeDistress();
+        assertTrue(engine.distressed());
+
+        // The pro-rata exit still pays every readable flavor and reports 0 for the broken one.
+        (, uint256[] memory quoted) = engine.previewRedeemMix(1_000e18);
+        vm.prank(alice);
+        uint256[] memory paid = engine.redeemMix(1_000e18, new uint256[](0));
+        assertEq(paid.length, 4);
+        assertEq(paid[0], 500e6, "A slice paid");
+        assertEq(paid[3], 0, "broken flavor skipped, not reverted");
+        assertEq(quoted[0], paid[0]);
+        assertEq(quoted[3], 0);
+        assertEq(flavorA.balanceOf(alice), 500e6);
+        assertEq(sumUsd.balanceOf(alice), 1_000e18);
     }
 }
