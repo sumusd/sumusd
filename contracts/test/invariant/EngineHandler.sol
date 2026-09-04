@@ -30,6 +30,7 @@ contract EngineHandler is Test {
     uint256 public ghostBurned; // total SumUSD burned across all successful redeems / redeemMix
     bool public redeemMixFair = true; // set false if any redeemMix ever reduced the backing ratio
     bool public singleRedeemNeverInDistress = true; // set false if a single-flavor redeem ever cleared below the line
+    bool public singleRedeemNeverLoweredRatio = true; // set false if a single-flavor redeem ever reduced the backing ratio
 
     constructor(
         SumUSDEngine _engine,
@@ -94,6 +95,16 @@ contract EngineHandler is Test {
             ghostBurned += amount;
             (uint256 enterBps,,) = engine.distressParams();
             if (ratioBefore < enterBps) singleRedeemNeverInDistress = false;
+            // A single-flavor redemption is never ratio-reducing: the effective rate is capped at the backing
+            // ratio (and clamped above par), so the value leaving per SumUSD burned never exceeds what the
+            // pool held per SumUSD. Same floored-valuation tolerance as the redeemMix fairness check below.
+            uint256 supplyAfter = sumUsd.totalSupply();
+            if (supplyAfter > 0) {
+                uint256 tolBps = (10_000 * collaterals.length) / supplyAfter + 1;
+                if (engine.systemCollateralizationRatioBps() + tolBps < ratioBefore) {
+                    singleRedeemNeverLoweredRatio = false;
+                }
+            }
         } catch {}
     }
 

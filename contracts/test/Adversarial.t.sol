@@ -245,4 +245,31 @@ contract AdversarialTest is Test {
         assertEq(actual, quoted, "redeem pays exactly what the view quoted");
         assertEq(actual, 99e6, "dead-feed redeem = base 99% at par");
     }
+
+    // -----------------------------------------------------------------
+    // WEAKNESS (fixed): while NOT distressed, backing can legitimately sit in [99%, 100%) (in-band sub-$1
+    // deposits, a mild depeg). A single-flavor redeem at an effective rate ABOVE that ratio paid the
+    // redeemer more per SumUSD than the pool held per SumUSD, so every such exit pushed the remaining
+    // holders' backing DOWN — the first-redeemer dynamic, one step at a time, and a single large redeem
+    // could walk a 99.5% pool straight through the 99% distress line without ever being gated. The
+    // effective rate is now capped at the backing ratio, so a redemption is never ratio-reducing.
+    // -----------------------------------------------------------------
+    function test_Fix_RedeemNeverPaysAboveBackingRatio() public {
+        engine.setCollateral(address(a), true, uint16(BPS), oracle); // 100% base is allowed by the rail
+        oracle.setPrice(address(a), 0.995e18); // worst in-band price
+        address whale = makeAddr("whale");
+        _deposit(whale, a, 1_000e6); // 1,000 SumUSD minted against $995 -> 99.5% backed, not distressed
+        uint256 ratioBefore = engine.systemCollateralizationRatioBps();
+        assertEq(ratioBefore, 9950);
+        assertFalse(engine.distressed());
+
+        assertEq(engine.redeemRateBpsFor(address(a), 500e18), 9950, "quoted rate is capped at the ratio");
+        vm.prank(whale);
+        uint256 out = engine.redeem(address(a), 500e18, 0);
+        // Uncapped this paid 500e6 (100%), leaving 500 A worth $497.50 against 500 SumUSD: 99.0%, one more
+        // redeem from distress, with the loss handed entirely to whoever exits last.
+        assertEq(out, 497.5e6, "payout capped at the backing ratio");
+        assertGe(engine.systemCollateralizationRatioBps(), ratioBefore, "a redemption never lowers backing");
+        assertFalse(engine.distressed(), "and can never walk the pool into distress by itself");
+    }
 }

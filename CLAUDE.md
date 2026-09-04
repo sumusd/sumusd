@@ -47,6 +47,15 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   and does NOT re-open the mint arb, which came from valuing a *low* price *up*. A dead feed falls through
   to par unchanged, preserving the oracle-independent exit; the residual is that a flavor which spikes
   above $1 and then loses its feed still pays par units, which is the price of that liveness guarantee.
+  **Backing-ratio cap (the below-par mirror).** The effective rate is also capped at the current backing
+  ratio (`_capAtBacking`, applied BEFORE the above-par clamp). Outside distress the ratio can legitimately
+  sit in [99%, 100%) (in-band sub-$1 deposits, a mild depeg); a redemption paid ABOVE it (100%-base flavor,
+  overweight bonus) handed out more per SumUSD than the pool held per SumUSD, lowering every remaining
+  holder's backing, and one large redeem could walk a 99.5% pool through the 99% line unguarded (the
+  distress check is a pre-check). With the cap NO redemption ever lowers the ratio (stateful invariant
+  `invariant_singleRedeemNeverLowersRatio`), which is the premise `redeemBatch`'s single gate relies on.
+  It can only bind under 100%, never below 99% (latched by then), so it costs at most 1pt and never
+  touches liveness. Applies to the dead-feed base-rate exit too (trimmed, never blocked).
 - **Convex weight-tilted haircut with a parity band — the *only* balance mechanism.** Each
   flavor has an equal-weight target (`1/funded`). A flavor redeems at its base `redeemRateBps`
   while its weight stays within a wide **parity band, `[target/2, 2×target]`** — moderate imbalance
@@ -94,11 +103,14 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   changes a rate and `previewRedeemBatch` matches the payout leg-for-leg (upholds preview == payout).
   Each leg still clamps to ≤100% and keeps the haircut, so a batch can never return more than face or
   lower backing — solvency-equivalent to N sequential `redeem` calls. The distress gate is checked
-  **once** up front (redemptions only raise backing, so a batch that starts in normal mode stays there);
+  **once** up front (a redemption never lowers backing thanks to the above-par clamp + ratio cap, so a
+  batch that starts in normal mode stays there);
   below the distress line it reverts `UseRedeemMix`. Atomic: any leg reverting (unlisted, dust,
   slippage, insufficient pool, length mismatch) reverts the whole call. `redeem` and `redeemBatch`
   share an internal `_redeemOne`; the previews share `_quoteRedeem`. Must be a native engine function
   (not a router): `SumUSD.burn` is `MINTER_ROLE`-only and burns `msg.sender` with no allowance path.
+  A batch may name the same flavor twice: on chain the second leg sees the balance the first drew down,
+  and `previewRedeemBatch` replays that draw-down (net + routed margin) so preview == payout still holds.
 - **Deposit peg-band guard.** A deposit reverts (`PriceOutOfBand`) if the collateral's oracle
   price deviates from $1.00 by more than `MAX_DEPOSIT_PRICE_DEVIATION_BPS` (0.5%, a constant).
   Redemptions are deliberately *not* gated by this, so holders can always exit during a depeg.
@@ -216,7 +228,13 @@ Consequences worth internalizing:
   quorum and an optional `maxSpreadBps` breaker. **`MAX_SOURCES = 5`** (lowered from 7): every source is
   a feed read multiplied by every listed collateral on the engine's hot path, so the cap is a direct
   multiplier on redemption gas. 5 still allows a 3-of-5 quorum with two spare providers.
-- `oracles/ChainlinkOracleAdapter.sol` — fail-closed AggregatorV3 wrapper. Also carries an optional
+- `oracles/ChainlinkOracleAdapter.sol` — fail-closed AggregatorV3 wrapper with a sane **ceiling only**
+  (`setFeed(token, aggregator, maxStaleness, maxPriceWad)`). There is deliberately NO sane floor: the
+  engine may bridge a revert with the (higher) last-good price under the stale fallback, so rejecting a
+  low live answer turned a real crash past the floor into an apparent outage — the flavor held its
+  pre-crash value for the grace window and cherry-pick redeems of the healthy flavors stayed open. A low
+  answer is passed through and valued as-is (conservative); only an implausibly HIGH one reverts.
+  Rule for any adapter: fail closed on *unavailable*, never on *low*. Also carries an optional
   **L2 sequencer uptime gate** (`setSequencerFeed(feed, gracePeriod)`, unset on L1): after a sequencer
   outage the first blocks back replay a burst of updates carrying *fresh* timestamps, so `maxStaleness`
   alone passes prices that reflect a market which moved without them. Reject until the network has been
@@ -249,6 +267,12 @@ MAX_COLLATERAL_DECIMALS` (18) — fail-fast at governance time (`InvalidCollater
 `CollateralProbeFailed`). This catches non-tokens/oversized-decimals but **cannot** detect
 rebasing/fee-on-transfer/transfer-hook tokens (they need a live transfer or manifest over time); those
 stay a governance whitelist-policy matter (see the collateral eligibility FAQ on the website).
+
+**Bricked-token resilience:** the listing probe checks `balanceOf` once, but an upgradeable token can
+break after listing. Every basket-wide read goes through `_tryBalanceOf` (staticcall, `(0,false)` on
+revert): such a flavor values at 0 (distress triggers honestly), `poolNeeds` skips it, and
+`redeemMix`/`previewRedeemMix` treat its slice as empty — the same "one broken flavor never blocks the
+exit" promise as the `_tryTransfer` skip. Single-flavor `redeem` of it still reverts (only that flavor).
 
 **Oracle resilience:** `collateralValueUsd` prices a collateral via `_valuationPriceWad`: the live
 feed (`_tryPriceWad`, try/catch) if available; else, if the **stale-price fallback** is enabled, the
@@ -294,7 +318,7 @@ The weight-tilted haircut is off until `setTiltSlopeBps(>0)` is called.
 - Single contract: `forge test --match-contract SumUSDEngineTest`
 - Gas report: `forge test --gas-report`
 - Static analysis: `slither . --config-file slither.config.json --fail-high` (CI gate is High; Mediums go to the Security tab as SARIF)
-- Symbolic properties: `halmos` (config `halmos.toml`; suites in `test/halmos/*.t.sol`, functions prefixed `check_`, ignored by `forge test`). Add a `check_` property when you add an immutable rail or a pricing bound. Size-dependent tilt-pricing properties time out in every solver (256-bit division chains); they live in `SumUSDEngineHalmosDeep`, excluded from CI, run by hand.
+- Symbolic properties: `forge clean && forge build --ast && halmos` (config `halmos.toml`; suites in `test/halmos/*.t.sol`, functions prefixed `check_`, ignored by `forge test`). The clean build matters: a cached build skips recompilation and leaves no AST, and halmos then silently skips every contract with `KeyError: 'ast'`. Add a `check_` property when you add an immutable rail or a pricing bound. Size-dependent tilt-pricing properties time out in every solver (256-bit division chains); they live in `SumUSDEngineHalmosDeep`, excluded from CI, run by hand.
 - Mythril: `myth analyze src/<Contract>.sol --solc-json mythril.solc.json --solv 0.8.34` (CI runs it per contract in Docker, blocks on High only)
 - CI: `.github/workflows/ci.yml` runs fmt/build/test + the three analyzers on push to `main` and on PRs. Tool versions are pinned in the workflow `env`; bump deliberately.
 - Format: `forge fmt`

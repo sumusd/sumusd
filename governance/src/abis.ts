@@ -34,7 +34,7 @@ export const GOV_ABI = parseAbi([
     "function grantRole(bytes32 role, address account)",
     "function revokeRole(bytes32 role, address account)",
     // --- ChainlinkOracleAdapter (a provider) ---
-    "function setFeed(address token, address aggregator, uint32 maxStaleness, uint128 minPriceWad, uint128 maxPriceWad)",
+    "function setFeed(address token, address aggregator, uint32 maxStaleness, uint128 maxPriceWad)",
     "function removeFeed(address token)",
     "function setSequencerFeed(address feed, uint32 gracePeriod)",
     // --- MedianOracleAdapter ---

@@ -236,4 +236,26 @@ contract RedeemBatchTest is Test {
         arr = new uint256[](1);
         arr[0] = x;
     }
+
+    /// A batch may name the same flavor twice. On chain the second leg sees the pool balance the first leg
+    /// left behind (so a scarce flavor prices worse on the second leg); the preview must replay that same
+    /// draw-down instead of quoting both legs on the untouched balance, or preview != payout.
+    function test_PreviewBatch_MatchesRepeatedFlavorLegs() public {
+        engine.setTiltSlopeBps(500);
+        engine.setRedeemMargin(2, 1);
+        engine.setMarginRecipient(recipient);
+        _deposit(alice, a, 1_000e6);
+        _deposit(alice, b, 1_000e6);
+        _deposit(alice, c, 300e18); // C at 13% of the basket: below the 16.7% knee, convex penalty live
+
+        address[] memory cols = _addr2(address(c), address(c));
+        uint256[] memory amts = _u2(50e18, 50e18);
+        uint256[] memory quoted = engine.previewRedeemBatch(cols, amts);
+        vm.prank(alice);
+        uint256[] memory paid = engine.redeemBatch(cols, amts, _u2(0, 0));
+
+        assertLt(paid[1], paid[0], "second leg prices on the thinner pool");
+        assertEq(quoted[0], paid[0], "leg 1 preview == payout");
+        assertEq(quoted[1], paid[1], "leg 2 preview == payout");
+    }
 }
