@@ -1141,13 +1141,20 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev Price used to VALUE a collateral for backing/tilt: the live feed if it answers; otherwise,
-    ///      if the stale-price fallback is enabled and the last-good price is within the grace window,
-    ///      that price minus `stalePriceHaircutBps`; otherwise 0. Never used for the deposit peg guard
-    ///      (live-only) or the redemption payout (par). `BPS - stalePriceHaircutBps` cannot underflow —
-    ///      the setter rails `stalePriceHaircutBps <= BPS`.
+    ///      the stale fallback ({_stalePriceWad}), else 0. Never used for the deposit peg guard (live-only)
+    ///      or the par conversion of the redemption payout; the payout's above-par clamp does use it (see
+    ///      {_liveRedeemRateBps}), so the value a redemption removes is bounded by the same number the
+    ///      backing ratio counts it at.
     function _valuationPriceWad(address token, IPriceOracle oracle) internal view returns (uint256) {
         (uint256 live, bool ok) = _tryPriceWad(token, oracle);
         if (ok) return live;
+        return _stalePriceWad(token);
+    }
+
+    /// @dev The stale-price fallback on its own (no live read): the last-good price minus
+    ///      `stalePriceHaircutBps` while the fallback is enabled and the cache is within the grace window;
+    ///      0 otherwise. `BPS - stalePriceHaircutBps` cannot underflow — the setter rails the haircut.
+    function _stalePriceWad(address token) internal view returns (uint256) {
         uint256 grace = stalePriceGraceSeconds;
         if (grace == 0) return 0;
         uint256 at = lastGoodPriceAt[token];
@@ -1254,12 +1261,18 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
 
     /// @dev The live effective redemption rate for `collateral`, computed exactly as {redeem} applies
     ///      it, so a quote can never diverge from the payout. An unpriceable feed (oracle reverts or
-    ///      returns 0) falls back to the flat base rate at par (the payout never depends on the oracle);
-    ///      otherwise the weight tilt via {_redeemRateFor} (penalty-direction-only for a frozen flavor).
-    ///      Either way the rate is then capped at the backing ratio ({_capAtBacking}) and, when live-priced,
-    ///      clamped above par ({_clampAbovePar}) — in that order, so the USD value paid never exceeds the
-    ///      ratio's worth per SumUSD. `poolBalance` is the pre-redemption pool balance of `collateral` (in
-    ///      its own decimals); `ratioBps` the backing ratio from the same basket snapshot.
+    ///      returns 0) falls back to the flat base rate (no tilt: the share cannot be weighed); otherwise
+    ///      the weight tilt via {_redeemRateFor} (penalty-direction-only for a frozen flavor). Either way
+    ///      the rate is then capped at the backing ratio ({_capAtBacking}) and clamped above par
+    ///      ({_clampAbovePar}) against the price the BACKING side counts the flavor at — the live price, or
+    ///      on a dead feed the stale fallback — in that order, so the counted value paid never exceeds the
+    ///      ratio's worth per SumUSD. The dead-feed clamp is what keeps a feed outage from reopening the
+    ///      flight-to-quality drain: with the fallback on, a flavor last seen at $1.18 whose feed then died
+    ///      was VALUED at ~$1.17 but PAID at par, so every redemption of it lowered backing for the whole
+    ///      grace window. The clamp only ever trims (never blocks) and expires with the cache, after which
+    ///      the exit is exactly par: no oracle can gate the exit, and no oracle can make it optimistic.
+    ///      `poolBalance` is the pre-redemption pool balance of `collateral` (in its own decimals);
+    ///      `ratioBps` the backing ratio from the same basket snapshot.
     function _liveRedeemRateBps(
         address collateral,
         CollateralConfig memory c,
@@ -1271,7 +1284,10 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ) internal view returns (uint256) {
         if (address(c.oracle) == address(0)) return 0; // unlisted: quote 0 rather than reverting
         (uint256 priceWad, bool priced) = _tryPriceWad(collateral, c.oracle);
-        if (!priced) return _capAtBacking(c.redeemRateBps, ratioBps); // dead feed: flat base rate at par
+        if (!priced) {
+            // Dead feed: flat base rate, clamped against the stale valuation (0 once the cache expires).
+            return _clampAbovePar(_capAtBacking(c.redeemRateBps, ratioBps), _stalePriceWad(collateral));
+        }
         uint256 rate = _redeemRateFor(c, _toUsdAt(poolBalance, c, priceWad), sumUsdAmount, totalUsd, funded);
         return _clampAbovePar(_capAtBacking(rate, ratioBps), priceWad);
     }
@@ -1289,7 +1305,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         uint256 ratioBps
     ) internal returns (uint256) {
         (uint256 priceWad, bool priced) = _tryPriceWad(collateral, c.oracle);
-        if (!priced) return _capAtBacking(c.redeemRateBps, ratioBps);
+        if (!priced) return _clampAbovePar(_capAtBacking(c.redeemRateBps, ratioBps), _stalePriceWad(collateral));
         _writeLastGood(collateral, priceWad);
         uint256 rate = _redeemRateFor(c, _toUsdAt(poolBalance, c, priceWad), sumUsdAmount, totalUsd, funded);
         return _clampAbovePar(_capAtBacking(rate, ratioBps), priceWad);
@@ -1316,8 +1332,9 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///      trading above $1 be drained for more value than the SumUSD burned represents — during a flight
     ///      to quality that is a standing incentive to strip the pool of its best asset and leave the
     ///      impaired one behind, and it makes redemption LOWER the backing ratio. Scaling the rate by
-    ///      `1/price` when `price > $1` is the conservative direction only: it can never increase a payout,
-    ///      and a dead feed (`priceWad == 0`, handled by the callers) falls through to par unchanged.
+    ///      `1/price` when `price > $1` is the conservative direction only: it can never increase a payout.
+    ///      Callers pass the live price, or on a dead feed the stale valuation; an expired cache passes 0,
+    ///      which falls through to par unchanged.
     function _clampAbovePar(uint256 rateBps, uint256 priceWad) internal pure returns (uint256) {
         if (priceWad <= WAD) return rateBps;
         return (rateBps * WAD) / priceWad;

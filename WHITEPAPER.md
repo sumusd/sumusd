@@ -527,10 +527,15 @@ safe:
   It is the mirror image of the rejected "clamp a low price up to $1", not a relaxation of it.
 - **Bounded by the sane band.** A compromised-high feed can only shrink a payout as far as the oracle
   adapter's configured upper bound allows (§3.3), and holders can still exit via any other flavor.
-- **Live-only, so the dead-feed exit is untouched.** An unpriceable flavor falls through to its flat base
-  rate at par exactly as before, preserving the oracle-independent exit. The residual is that a flavor
-  which spikes above $1.00 and *then* loses its feed still pays par units; that is the price of the
-  liveness guarantee, and it is bounded by the stale-price grace window.
+- **Clamped against the price backing is counted at, so a feed outage cannot reopen the drain.** With a
+  live feed the clamp uses the live price. On a dead feed it uses the stale-price fallback (§3.3), the same
+  number the backing ratio values the flavor at, and 0 (no clamp, par) once that cache expires. An earlier
+  version clamped on the live price only and accepted "a flavor which spikes above $1.00 and then loses
+  its feed pays par units" as a residual; once the stale fallback shipped that residual became a leak the
+  invariant suite caught: the flavor was *valued* at its cached ~$1.18 but *paid* at par, so every
+  redemption of it lowered backing for the whole grace window. The exit is still oracle-independent in
+  the sense that matters: no feed state can block it, only trim it, and after the grace window it is
+  exactly the flat base rate at par.
 
 ### 5.8 The backing-ratio cap
 

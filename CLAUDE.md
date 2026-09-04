@@ -44,9 +44,13 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   was drained at par during a flight to quality — stripping the pool of its best asset, leaving the
   impaired one behind, and *lowering* the backing ratio (which also falsified the "redemptions only raise
   backing" premise behind `redeemBatch`'s single distress check). This is the conservative direction only
-  and does NOT re-open the mint arb, which came from valuing a *low* price *up*. A dead feed falls through
-  to par unchanged, preserving the oracle-independent exit; the residual is that a flavor which spikes
-  above $1 and then loses its feed still pays par units, which is the price of that liveness guarantee.
+  and does NOT re-open the mint arb, which came from valuing a *low* price *up*. On a DEAD feed the clamp
+  uses the stale-price fallback (`_stalePriceWad`, the same number backing counts the flavor at) and falls
+  through to par only once that cache expires. It was live-only until 2026-09-04; with the stale fallback
+  on, a flavor last seen at $1.18 whose feed then died was VALUED at ~$1.17 but PAID at par, so every
+  redemption of it lowered backing for the whole grace window (caught by
+  `invariant_singleRedeemNeverLowersRatio` in CI, regression `test_Fix_DeadFeedRedeemClampedByStaleValuation`).
+  No feed state can block the exit, only trim it.
   **Backing-ratio cap (the below-par mirror).** The effective rate is also capped at the current backing
   ratio (`_capAtBacking`, applied BEFORE the above-par clamp). Outside distress the ratio can legitimately
   sit in [99%, 100%) (in-band sub-$1 deposits, a mild depeg); a redemption paid ABOVE it (100%-base flavor,
