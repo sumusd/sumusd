@@ -298,8 +298,10 @@ If an issuer permanently blacklists the engine so a flavor's balance is stuck:
 ### Recover from distress
 
 1. Confirm the latch: `cast call $ENGINE "distressed()(bool)"`. While set, single-flavor `redeem` and
-   `redeemBatch` revert `UseRedeemMix`; holders exit pro-rata via `redeemMix`, which stays open
-   throughout and needs no oracle.
+   `redeemBatch` revert `UseRedeemMix`, and `deposit` reverts `MintDisabledInDistress` at any ratio;
+   holders exit pro-rata via `redeemMix`, which stays open throughout, needs no oracle to share a
+   shortfall, and caps each slice at $1 of backing per SumUSD once a recap lifts backing above par (so
+   exits during recovery raise the ratio rather than skim the surplus).
 2. Fix the cause: oracle recovery, or `donate(collateral, amount)` from anyone (permissionless, mints no
    SumUSD, purely additive to backing).
 3. Backing must reach **100.25%**, not just 99%. The gap is deliberate: a par redemption at a rate equal

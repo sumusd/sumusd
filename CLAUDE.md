@@ -124,8 +124,11 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   deposits drive backing asymptotically toward 99.50% and no further — which is what makes it impossible
   to grief the system into distress with deposits alone. The 50 bps of slack IS the margin; widening the
   peg band to 100 bps would silently delete it. The first deposit (zero supply → "infinite" backing) is always allowed; minting
-  auto-resumes once backing recovers to ≥ 99%. This makes `systemCollateralizationRatioBps()`
-  load-bearing on the mint path. Redemptions remain open regardless.
+  auto-resumes once backing recovers to ≥ 99% AND the distress latch has cleared. **`deposit` also reverts
+  `MintDisabledInDistress` whenever `distressed` is set, at any ratio** (the latched regime is exit-only;
+  a par-minted deposit taken straight back out through the haircut-free `redeemMix` would be the mint arb
+  unbounded, and was half of the surplus-drain loop). Recap while latched is `donate`. This makes
+  `systemCollateralizationRatioBps()` load-bearing on the mint path. Redemptions remain open regardless.
 - **Distress mode / anti-run (`redeemMix`), LATCHED with hysteresis.** Below
   `DISTRESS_ENTER_RATIO_BPS` (99%, == the mint floor) the system latches `distressed = true`
   (instantly — a safety action never waits) and the pick-your-flavor `redeem` is disabled (reverts
@@ -133,7 +136,12 @@ The protocol is a **pooled peg-stability module**, implemented entirely in
   **`redeemMix(amount, minOut[])`** — a pro-rata claim returning `amount / totalSupply` of **every**
   listed collateral (enabled and frozen). This shares the shortfall equally regardless of redemption
   order (kills the first-redeemer run), keeps the backing ratio flat as holders exit, and uses **no
-  oracle / no haircut / no tilt** (pure ownership math, robust to dead feeds). A flavor whose
+  haircut / no tilt** (ownership math, robust to dead feeds). **Par cap:** while backing is ABOVE 100%
+  (the recovery window) every slice is scaled by `supply / backingUsd` (`_capMixSlice`), so a SumUSD
+  never exits with more than $1 of backing; below par the raw slice is paid and a dead feed can only
+  lower the ratio, never shrink a slice. Without it the surplus above par was fully extractable during
+  every recovery window (deposit + redeemMix in one tx took `ratio - 1` per unit AND reset the recovery
+  clock once the ratio slipped under 100.25%). With it every exit RAISES backing. A flavor whose
   transfer **fails** (e.g. its issuer blacklisted the engine) is **skipped, not reverted**
   (`_tryTransfer`), so one stuck collateral can't brick the whole exit — its slice stays pooled and
   `amounts[i]` reports 0. `redeemMix` reverts `NotDistressed` while not latched; single-flavor `redeem`

@@ -268,6 +268,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     error InvalidRedeemMargin(uint16 redeemMarginBps, uint16 marginToRecipientBps);
     error InvalidStalePriceParams(uint32 graceSeconds, uint16 haircutBps);
     error CollateralBackingExcluded(address token);
+    error MintDisabledInDistress(uint256 ratioBps);
 
     /// @param admin   Owner of the engine (risk admin / governance).
     /// @param _sumUsd The SumUSD token. The engine must be granted MINTER_ROLE on it separately.
@@ -289,7 +290,8 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     ///         gates the peg-band guard. One unit of any accepted collateral mints one SumUSD.
     /// @dev Reverts `UnderCollateralized` if system backing is below `MIN_MINT_RATIO_BPS` (99%);
     ///      no new SumUSD is issued into an under-backed pool. First deposit at zero supply is always
-    ///      allowed.
+    ///      allowed. Also reverts `MintDisabledInDistress` while the distress latch is set, whatever the
+    ///      ratio: the latched regime is exit-only (see {_syncDistress}); recapitalization is {donate}.
     /// @param collateral Accepted collateral token.
     /// @param amount     Amount of collateral to deposit (in the token's own decimals).
     /// @param minSumUsdOut Minimum SumUSD to accept (guards against fee-on-transfer shortfalls).
@@ -317,6 +319,11 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         // Mint guard: do not issue new SumUSD while backing is below MIN_MINT_RATIO_BPS.
         // Checked on the pre-deposit snapshot; bootstrap (supply == 0) reads as fully backed.
         if (ratioBps < MIN_MINT_RATIO_BPS) revert UnderCollateralized(ratioBps);
+        // No minting into a latched system either. While distressed the only exit is the haircut-free
+        // pro-rata {redeemMix}; a par-minted deposit taken straight back out through it would be the
+        // peg-band mint arbitrage with no haircut to bound it, and (before the par cap) it was the loop
+        // that skimmed the surplus during recovery and reset the clock. Recap is {donate}, not minting.
+        if (distressed) revert MintDisabledInDistress(ratioBps);
 
         uint256 balBefore = IERC20(collateral).balanceOf(address(this));
         IERC20(collateral).safeTransferFrom(msg.sender, address(this), amount);
@@ -525,12 +532,20 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Pro-rata "redeem the mix": burn `sumUsdAmount` and receive `sumUsdAmount / totalSupply`
-    ///         of EVERY listed collateral (enabled and frozen). Only callable when the system is
-    ///         distressed (see {distressed} and the hysteresis in {_syncDistress}); it is the fair, order-independent exit
-    ///         that shares the shortfall equally across all holders (no first-redeemer advantage).
-    /// @dev Payout is pure ownership math — no oracle, no haircut, no tilt — so it works even with
-    ///      dead feeds. `minOut` is per-collateral slippage protection on the computed slice: pass an
-    ///      empty array to skip, or one of length `collateralList.length` aligned to {listedCollaterals}.
+    ///         of EVERY listed collateral (enabled and frozen), capped at $1.00 of backing per SumUSD.
+    ///         Only callable when the system is distressed (see {distressed} and the hysteresis in
+    ///         {_syncDistress}); it is the fair, order-independent exit that shares the shortfall equally
+    ///         across all holders (no first-redeemer advantage).
+    /// @dev Payout is ownership math — no haircut, no tilt — with ONE oracle-derived input, used on the
+    ///      conservative side only: while the backing ratio is above 100% (the recovery window after a
+    ///      recap) every slice is scaled by `1/ratio` ({_mixCapBps}), so a SumUSD never exits with more
+    ///      than $1.00 of backing. Below par the slices are the raw pro-rata share and dead feeds (which
+    ///      can only LOWER the ratio) can never shrink a payout, so the oracle-free exit is intact where it
+    ///      matters. Without the cap, the surplus above par was fully extractable during every recovery
+    ///      window and each extraction reset the recovery clock; with it the excess stays pooled, so every
+    ///      exit RAISES backing and shortens recovery. `minOut` is per-collateral slippage protection on
+    ///      the (capped) slice: pass an empty array to skip, or one of length `collateralList.length`
+    ///      aligned to {listedCollaterals}.
     ///      A flavor whose transfer FAILS (e.g. the issuer blacklisted the engine) is SKIPPED, not
     ///      reverted, so one non-transferable collateral can never brick the whole exit; its slice
     ///      stays pooled and the returned `amounts[i]` is 0 for any skipped flavor.
@@ -540,7 +555,8 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         nonReentrant
         returns (uint256[] memory amounts)
     {
-        uint256 ratioBps = systemCollateralizationRatioBps();
+        (uint256 backingUsd,,) = _basketSnapshot();
+        uint256 ratioBps = _ratioBps(backingUsd);
         _syncDistress(ratioBps);
         if (!distressed) revert NotDistressed(ratioBps);
         if (sumUsdAmount == 0) revert ZeroAmount();
@@ -555,7 +571,7 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
             // A flavor whose balance can't even be READ (bricked token) is treated as an empty slice, for the
             // same reason a failing transfer is skipped below: one broken collateral must never block the exit.
             (uint256 poolBalance,) = _tryBalanceOf(collateralList[i]);
-            uint256 out = (poolBalance * sumUsdAmount) / supply;
+            uint256 out = _capMixSlice((poolBalance * sumUsdAmount) / supply, supply, backingUsd);
             amounts[i] = out;
             if (out != 0) ++nonZero;
             if (minOut.length != 0 && out < minOut[i]) revert SlippageExceeded(out, minOut[i]);
@@ -648,7 +664,8 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @notice Quote {redeemMix}: the per-collateral units a pro-rata redemption of `sumUsdAmount`
-    ///         would return right now (in `collateralList` order). Independent of regime/oracle.
+    ///         would return right now (in `collateralList` order), including the above-par cap. Quoted
+    ///         regardless of regime (it is only callable while distressed).
     function previewRedeemMix(uint256 sumUsdAmount)
         external
         view
@@ -658,13 +675,24 @@ contract SumUSDEngine is Ownable2Step, ReentrancyGuard {
         tokens = new address[](len);
         amounts = new uint256[](len);
         uint256 supply = sumUsd.totalSupply();
+        (uint256 backingUsd,,) = _basketSnapshot();
         for (uint256 i; i < len; ++i) {
             tokens[i] = collateralList[i];
             if (supply != 0) {
                 (uint256 poolBalance,) = _tryBalanceOf(collateralList[i]);
-                amounts[i] = (poolBalance * sumUsdAmount) / supply;
+                amounts[i] = _capMixSlice((poolBalance * sumUsdAmount) / supply, supply, backingUsd);
             }
         }
+    }
+
+    /// @dev Cap one {redeemMix} slice at par. While `backingUsd <= supply` (at or under 100%) the raw
+    ///      pro-rata `slice` is returned unchanged; above it the slice is scaled by `supply / backingUsd`, so
+    ///      summed over the basket the USD value leaving per SumUSD burned is exactly $1.00 (floored). Uses
+    ///      the raw WAD totals rather than the bps ratio so the cap never rounds in the redeemer's favor.
+    ///      Only ever shrinks a payout, and only when the pool holds MORE than the claim, so it cannot touch
+    ///      the shortfall-sharing guarantee below par.
+    function _capMixSlice(uint256 slice, uint256 supply, uint256 backingUsd) internal pure returns (uint256) {
+        return backingUsd > supply ? (slice * supply) / backingUsd : slice;
     }
 
     /// @notice The full list of currently-listed collaterals (the order used by {redeemMix} arrays).
